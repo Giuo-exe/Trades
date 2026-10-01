@@ -1,0 +1,19 @@
+{
+  "name": "market-weather",
+  "version": "0.1.0",
+  "description": "Meteo del mercato: GEX + orderflow per BTC, ETH, SOL, GOLD",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/",
+    "tv-sync": "node src/tvSync.js",
+    "tv-setup": "node src/tvSetup.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

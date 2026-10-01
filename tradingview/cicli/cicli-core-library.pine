@@ -1,0 +1,2654 @@
+//@version=6
+// EP library draft derived mechanically from EN. Local only; not published or editor-compiled.
+// Source SHA-256: 4968f7a5c88da8555bdbc6af20da3639ab2bee1a4542fd9bbb20c096447d71f5
+library("CicliCore", overlay=true)
+
+// Input-independent values copied exactly from EN.
+const int raccT5MinBars = 6
+const int raccT5MaxBars = 10
+const int raccT6MinBars = 3
+const int raccT6MaxBars = 5
+const int weeklyMinCycles = 6
+const int newTConfirmCycles = 11
+const color newTColor = color.yellow
+const color newTSoftColor = color.rgb(255, 245, 160)
+const color specialResetColor = color.rgb(80, 170, 255)
+const color emergencyRecoveryIndexColor = color.rgb(170, 88, 18)
+const color emergencyRecoveryInverseColor = color.rgb(155, 89, 182)
+const color alternativeCloseColor = #E74C3C
+const int t3MinBars = 2
+const int t2MinBars = 5
+const int rangeLegacyMaxBars = 44 // Solo blocker del range: non cambia il massimo del motore.
+const int RACC_NONE = 0
+const int RACC_T6 = 6
+const int RACC_T5 = 5
+const int RACC_T4 = 4
+const int RACC_T3 = 3
+const int RACC_INVALID = -1
+const int RACC_RESET = -3
+const int RACC_RECOVERY = -4
+
+// Public data structures. Original field order and defaults retained.
+export type Candidate
+	int     barIdx              // Possibile start del ciclo successivo.
+	float   price               // Low indice o high inverso.
+	int     duration            // Barre dal nodo padre.
+	int     swingState          // 0=nessuno, 1=sinistra, 2=sinistra+destra.
+	bool    sequenceValid       // Validità monotona calcolata prima del ranking.
+	float   levelBefore         // Livello monotono prima di questo candidato.
+	bool    constraintOk        // Vincolo storico soddisfatto alla sua chiusura.
+	int     attemptCount
+export type PossibleRaccordo
+	int     startBar
+	int     endBar
+	float   endPrice
+	int     raccType            // 6=T-6, 5=T-5, 4=T-4.
+export type ContinuationPick
+	Candidate candidate
+	int       score
+	int       mode
+	int       raccType
+	int       raccEndBar
+export type CycleNode
+	int             id
+	int             startBar
+	float           startPrice
+	Candidate[]     candidates          // Figli potenziali ordinati.
+	float           lastValidLevel      // Livello monotono del vincolo corrente.
+	int             lastValidBar        // Barra che ha aggiornato il livello.
+	bool            isLocked            // Vincolo giornaliero attivo.
+	float           preLockExtreme      // Max pre-lock indice, min pre-lock inverso.
+	bool            isClosed
+	bool            isRaccordoConfirmed
+	int             raccType            // 0, raccordo T-6..T-3, -3 reset o -4 recovery.
+	bool            hasAlternatives
+	bool            preLockInvalidated     // Persistente dopo ricostruzione/backtracking, inclusi i gap.
+	label[]         alternativeLabels
+	line            lnCycle
+	line            lnVert
+	label           lblInfo
+	label           lblInvalidation
+	int             weeklyOrder = 0 // Solo gerarchia opzionale; non partecipa alla selezione.
+
+// Snapshot diagnostico, costruito solo sull'ultima barra. Non crea nodi del
+// motore e non modifica la chain scelta: serve esclusivamente a confrontare
+// centrature concorrenti e a renderizzare score/frecce.
+export type ConstraintScenario
+	int     lineageBar          // Prima partenza alternativa del ramo.
+	int     startBar            // T-3/T-3i corrente nello scenario.
+	int     lockBar
+	bool    invalidated
+	int     rank
+	int     score
+	string  driver
+
+export type ConstraintMarker
+	int     lineageBar
+	int     closeBar            // Chiusura del T-3 precedente, distinta dallo start sul true spike.
+	int     startBar
+	int     cycleId              // rank >= 7000: ordinale weekly libero; altrimenti daily.
+	int     rank
+
+export type SideRuntime
+	int   startBar
+	int   previousWeeklyStart
+	int   weeklyContextStart
+	bool  weeklyWarning
+	int   lockCandidateBar
+	int   firstLockBar
+	bool  weeklyLocked
+	bool  preLockAlert
+	label counterLabel
+	label[] newTLabels
+	label[] ghostLabels
+	line[]  swingLines
+	line[]  fibLockLines
+	label[] fibLockLabels
+	line[]  fibWeeklyLines
+	label[] fibWeeklyLabels
+	line[]  timingLines
+	label[] scenarioLabels
+	CycleNode[] chain
+	CycleNode[] weeklyHistory
+	string[] triedStarts
+
+export type EngineConfig
+    int cycleMinBars
+    int cycleMaxBars
+    bool allow23Exception
+    int raccT4MinBars
+    int raccT4MaxBars
+    int raccT6MinAge
+    int raccT5MinAge
+    int raccT4MinAge
+    int newTLeftBars
+    int newTRightBars
+    int t1MinBars
+    int currentCheckDelay
+    int maxBacktrackDepth
+    bool fullBacktrackOnFailure
+    bool cleanCycleLabels
+    bool showDailyLines
+    bool showRaccordoLines
+    float cycleLineClearancePct
+    float cycleLabelGapPct
+    bool showGhosts
+    bool weeklyConstraintEnabled
+    color weeklyIndexColor
+    color weeklyInverseColor
+    bool showEvolvedSwings
+    bool showHigherAnalysis
+    color lineColorIndex
+    color labelColorIndex
+    color lineColorInverse
+    color labelColorInverse
+    color raccordoColor
+    color labelColorRaccordo
+    color lineColorIndexLocked
+    color lockedTextColorIndex
+    color lineColorInverseLocked
+    color lockedTextColorInverse
+    color ghostColor
+    color swingT3Color
+    color swingTColor
+    color swingT1Color
+    color swingT2Color
+    color prospT3Color
+    color prospT2Color
+    color prospT1Color
+    string prospMarkerShape
+    string prospMarkerSize
+    string prospTextSize
+    bool prospShowShape
+    bool prospShowText
+    float prospOffsetPct
+    float prospTextGapPct
+    float prospCurrentExtraPct
+    bool debugMode
+
+export type EngineContext
+    SideRuntime indexRuntime
+    SideRuntime inverseRuntime
+    map<string, int> evolvedRankCache
+    map<string, line> drawnSwingLines
+    map<string, label> drawnSwingLabels
+    map<string, int> drawnSwingKinds
+
+// External state is passed only to functions that read it; no input calls here.
+export raccText(int raccType) =>
+	raccType == RACC_T6 ? "T-6" : raccType == RACC_T5 ? "T-5" : raccType == RACC_T4 ? "T-4" : raccType == RACC_T3 ? "T-3" : raccType == RACC_RESET ? "3***" : raccType == RACC_RECOVERY ? "RECOVERY" : ""
+
+// ==============================================================================
+// 2. FORMATTAZIONE LABEL E REGOLE BASE
+// ==============================================================================
+export fmtLbl(bool isIdx, int id, bool uncertain) =>
+	string sfx = isIdx ? "T-3" : "T-3i"
+	string base = id == 0 ? (isIdx ? "T" : "Ti") : str.tostring(id + 1) + "'" + sfx
+	uncertain ? base + "?" : base
+fmtReset(bool isIdx, int id) =>
+	fmtLbl(isIdx, id, false) + "***"
+addDoubleLockBolt(string txt) =>
+	txt + " ⚡⚡"
+isValidDuration(EngineConfig cfg, int dur) =>
+	dur >= cfg.cycleMinBars or (cfg.allow23Exception and dur == 23)
+isCanonicalClosureDuration(EngineConfig cfg, int dur, bool closeOnColor) =>
+	dur >= cfg.cycleMinBars and dur <= cfg.cycleMaxBars or cfg.allow23Exception and dur == 23 and closeOnColor
+export isEarly23Duration(EngineConfig cfg, int dur) =>
+	cfg.allow23Exception and dur == 23
+export dailyTextColor(EngineConfig cfg, bool isIndex, bool locked) =>
+	locked ? (isIndex ? cfg.lockedTextColorIndex : cfg.lockedTextColorInverse) : (isIndex ? cfg.labelColorIndex : cfg.labelColorInverse)
+cycleLabelStyle(EngineConfig cfg, bool isIndex) =>
+	cfg.cleanCycleLabels ? (isIndex ? label.style_label_upper_left : label.style_label_lower_left) : isIndex ? label.style_label_up : label.style_label_down
+// Costruttori condivisi: gli argomenti impliciti dei built-in si compilano
+// una sola volta qui. Geometria, default e ordine di creazione restano invariati.
+export plainTimeLabel(int x, float y, string txt, color textColor, string textSize) =>
+	label.new(x, y, txt, xloc=xloc.bar_time, color=color(na), textcolor=textColor, style=label.style_none, size=textSize, force_overlay=true)
+pivotTimeLabel(bool isIndex, int x, float y, string txt, color bg, color fg, string textSize) =>
+	label.new(x, y, txt, xloc=xloc.bar_time, color=bg, textcolor=fg, style=isIndex ? label.style_label_up : label.style_label_down, size=textSize, force_overlay=true)
+export cycleTimeLabel(EngineConfig cfg, bool isIndex, int x, float y, string txt, color baseColor, color textColor, string textSize) =>
+	label.new(x, y, txt, xloc=xloc.bar_time, color=cfg.cleanCycleLabels ? color(na) : color.new(baseColor, 80), textcolor=textColor, style=cycleLabelStyle(cfg, isIndex), size=textSize, textalign=cfg.cleanCycleLabels ? text.align_left : text.align_center, force_overlay=true)
+export cycleHorizontal(int x, float price, int endTime, color col) =>
+	line.new(x, price, endTime, price, xloc=xloc.bar_time, color=col, width=2, force_overlay=true)
+export cycleVertical(int x, float price, color col) =>
+	line.new(x, price * 0.999, x, price * 1.001, xloc=xloc.bar_time, color=col, style=line.style_dotted, force_overlay=true)
+export indexVertical(int x, float y1, float y2, color col, string extension, int width) =>
+	line.new(x, y1, x, y2, xloc=xloc.bar_index, extend=extension, color=col, width=width, style=line.style_solid, force_overlay=true)
+export newSideRuntime() =>
+	SideRuntime.new(na, na, na, false, na, na, false, false, na, array.new<label>(), array.new<label>(), array.new<line>(), array.new<line>(), array.new<label>(), array.new<line>(), array.new<label>(), array.new<line>(), array.new<label>(), array.new<CycleNode>(), array.new<CycleNode>(), array.new<string>())
+
+
+export sideRuntime(EngineContext ctx, bool isIndex) =>
+	isIndex ? ctx.indexRuntime : ctx.inverseRuntime
+
+export isRaccordo(CycleNode node) =>
+	node.raccType > RACC_NONE
+
+export isActiveRegularNode(CycleNode node) =>
+	not node.isClosed and not isRaccordo(node) and node.raccType != RACC_RESET and node.raccType != RACC_RECOVERY
+
+export isWaitingDecision(CycleNode node) =>
+	node.raccType == RACC_RESET and not node.isClosed
+
+isCanonicalCandidate(EngineConfig cfg, Candidate candidate) =>
+	isValidDuration(cfg, candidate.duration) and candidate.duration <= cfg.cycleMaxBars
+
+export isConfirmedCanonicalCandidate(EngineConfig cfg, Candidate candidate) =>
+	isCanonicalCandidate(cfg, candidate) and candidate.swingState == 2
+
+isLeftCanonicalCandidate(EngineConfig cfg, Candidate candidate) =>
+	isCanonicalCandidate(cfg, candidate) and candidate.swingState >= 1
+
+export isMoreExtreme(bool isIndex, float value, float reference) =>
+	isIndex ? value < reference : value > reference
+
+isAtOrMoreExtreme(bool isIndex, float value, float reference) =>
+	isIndex ? value <= reference : value >= reference
+
+export sidePivot(bool isIndex) =>
+	isIndex ? low : high
+
+export sidePivotAt(bool isIndex, int offset) =>
+	isIndex ? low[offset] : high[offset]
+
+export historyOffsetOk(int offset) =>
+	offset >= 0 and offset <= 5000
+
+export scanOffsetOk(int offset) =>
+	offset >= 0 and offset < 5000
+
+export historyTimeAt(int targetBar) =>
+	int offset = bar_index - targetBar
+	historyOffsetOk(offset) ? time[offset] : na
+
+export sidePivotOnBar(bool isIndex, int targetBar) =>
+	int offset = bar_index - targetBar
+	historyOffsetOk(offset) ? sidePivotAt(isIndex, offset) : na
+
+export oppositePivotAt(bool isIndex, int offset) =>
+	isIndex ? high[offset] : low[offset]
+
+// ==============================================================================
+// 5. REGISTRI DELLE DUE CHAIN E UTILITY DI DURATA
+// ==============================================================================
+
+getStartCountOffset(bool isIndex, int startBar) =>
+	int offsetValue = 0
+	int histOffset = bar_index - startBar
+	if historyOffsetOk(histOffset)
+		bool zeroBarColor = isIndex ? close[histOffset] < open[histOffset] : close[histOffset] >= open[histOffset]
+		offsetValue := zeroBarColor ? 0 : 1
+	offsetValue
+
+export cycleDurationFrom(bool isIndex, int startBar, int endBar) =>
+	endBar - startBar + getStartCountOffset(isIndex, startBar)
+candidateDuration(EngineConfig cfg, bool isIndex, int startBar, int offset, float target) =>
+	int dur = cycleDurationFrom(isIndex, startBar, bar_index - offset)
+	bool rightColor = isIndex ? close[offset] < open[offset] : close[offset] >= open[offset]
+	if not rightColor
+		// Il colore e' obbligatorio soltanto per l'eccezione anticipata a 23.
+		// Raggiunta la durata minima ordinaria (24 Crypto/MIB, 21 Standard), la
+		// barra puo' chiudere il ciclo con qualsiasi colore: non retrocederla a 23/20.
+		bool minimumColorFree = dur == cfg.cycleMinBars
+		bool keepRaw = false
+		if offset > 0
+			keepRaw := isIndex ? close[offset - 1] >= open[offset - 1] and low[offset - 1] < target : close[offset - 1] < open[offset - 1] and high[offset - 1] > target
+		dur := minimumColorFree or keepRaw ? dur : dur - 1
+	dur
+export cycleCloseBarFromDuration(bool isIndex, int startBar, int duration) =>
+	startBar + duration - getStartCountOffset(isIndex, startBar)
+firstExtremeBar(bool isIndex, float startPrice, int scanFirstBar, int throughBar) =>
+	int lockBar = na
+	int limitBar = math.min(bar_index, throughBar)
+	if limitBar >= scanFirstBar
+		for b = scanFirstBar to limitBar
+			int offset = bar_index - b
+			if scanOffsetOk(offset)
+				float v = sidePivotAt(isIndex, offset)
+				if isMoreExtreme(isIndex, v, startPrice)
+					lockBar := b
+					break
+	lockBar
+
+export firstLockBarUntil(EngineConfig cfg, bool isIndex, int nodeStartBar, float startPrice, int throughBar) =>
+	firstExtremeBar(isIndex, startPrice, nodeStartBar, math.min(throughBar, cycleCloseBarFromDuration(isIndex, nodeStartBar, cfg.cycleMinBars) - 1))
+
+export constraintStateUntil(EngineConfig cfg, bool isIndex, int nodeStartBar, float startPrice, int throughBar) =>
+	bool wasLocked = false
+	float level = startPrice
+	int levelBar = nodeStartBar
+	int cappedEndBar = math.min(bar_index, throughBar)
+	int lockWindowEnd = math.min(cappedEndBar, cycleCloseBarFromDuration(isIndex, nodeStartBar, cfg.cycleMinBars) - 1)
+	if cappedEndBar >= nodeStartBar
+		for b = nodeStartBar to cappedEndBar
+			if b > lockWindowEnd and not wasLocked
+				break
+			int offset = bar_index - b
+			if scanOffsetOk(offset)
+				float v = sidePivotAt(isIndex, offset)
+				if not na(v) and isMoreExtreme(isIndex, v, level)
+					wasLocked := true
+					level := v
+					levelBar := b
+	[wasLocked, level, levelBar]
+
+// Verifica il vincolo nello stato storico della chiusura candidata. Usare lo
+// stato del nodo alla barra corrente e' scorretto: gli estremi successivi alla
+// chiusura appartengono al T-3 seguente e non possono invalidarla a posteriori.
+candidateSatisfiesConstraintAtClose(EngineConfig cfg, bool isIndex, int nodeStartBar, float startPrice, int candidateBar, float candidatePrice) =>
+	[wasLocked, levelAtClose, _] = constraintStateUntil(cfg, isIndex, nodeStartBar, startPrice, candidateBar)
+	not wasLocked or isAtOrMoreExtreme(isIndex, candidatePrice, levelAtClose)
+
+export collectRaccordoCooldowns(CycleNode[] chain, int minEndBar, int maxEndBarExclusive) =>
+	int lastT6 = 0
+	int lastT5 = 0
+	int lastT4 = 0
+	if array.size(chain) > 0
+		for node in chain
+			int endBar = node.lastValidBar
+			if isRaccordo(node) and not na(endBar) and not na(minEndBar) and endBar >= minEndBar and endBar < maxEndBarExclusive
+				if node.raccType == RACC_T6
+					lastT6 := math.max(lastT6, endBar)
+				else if node.raccType == RACC_T5
+					lastT5 := math.max(lastT5, endBar)
+					lastT6 := math.max(lastT6, endBar)
+				else if node.raccType == RACC_T4
+					lastT4 := math.max(lastT4, endBar)
+					lastT5 := math.max(lastT5, endBar)
+					lastT6 := math.max(lastT6, endBar)
+	[lastT6, lastT5, lastT4]
+
+export raccordoSpacingFromCooldowns(EngineConfig cfg, int raccType, int currentBar, int lastT6, int lastT5, int lastT4) =>
+	bool isValid = true
+	if raccType == RACC_T6
+		isValid := currentBar - math.max(lastT6, math.max(lastT5, lastT4)) >= cfg.raccT6MinAge
+	else if raccType == RACC_T5
+		isValid := currentBar - math.max(lastT5, lastT4) >= cfg.raccT5MinAge
+	else if raccType == RACC_T4
+		isValid := currentBar - math.max(lastT4, lastT5) >= cfg.raccT4MinAge
+	isValid
+
+isRaccordoSpacingValid(EngineConfig cfg, EngineContext ctx, bool isIndex, int raccType, int currentBar) =>
+	CycleNode[] activeChain = isIndex ? ctx.indexRuntime.chain : ctx.inverseRuntime.chain
+	int activeWeeklyStart = isIndex ? ctx.indexRuntime.startBar : ctx.inverseRuntime.startBar
+	[lastT6, lastT5, lastT4] = collectRaccordoCooldowns(activeChain, activeWeeklyStart, currentBar)
+	raccordoSpacingFromCooldowns(cfg, raccType, currentBar, lastT6, lastT5, lastT4)
+getMemoKey(int barIdx, int parentId, bool isLocked) =>
+	str.tostring(barIdx) + "_" + str.tostring(parentId) + "_" + str.tostring(isLocked)
+do_markAsTried(string[] arr, int barIdx, int parentId, bool isLocked) =>
+	string key = getMemoKey(barIdx, parentId, isLocked)
+	if not array.includes(arr, key)
+		array.push(arr, key)
+
+clearAlternativeLabels(CycleNode node) =>
+	if array.size(node.alternativeLabels) > 0
+		for lbl in node.alternativeLabels
+			label.delete(lbl)
+		array.clear(node.alternativeLabels)
+	true
+
+method clearVisuals(CycleNode node) =>
+	line.delete(node.lnCycle)
+	line.delete(node.lnVert)
+	label.delete(node.lblInfo)
+	label.delete(node.lblInvalidation)
+	clearAlternativeLabels(node)
+export method paint(CycleNode node, EngineConfig cfg, color lineColor, color textColor, int alpha) =>
+	bool linesVisible = isRaccordo(node) ? cfg.showRaccordoLines : cfg.showDailyLines
+	line.set_color(node.lnCycle, linesVisible ? lineColor : color(na))
+	line.set_color(node.lnVert, linesVisible ? lineColor : color(na))
+	label.set_color(node.lblInfo, cfg.cleanCycleLabels ? color(na) : color.new(lineColor, alpha))
+	label.set_textcolor(node.lblInfo, textColor)
+
+export refreshCycleGeometry(EngineConfig cfg, bool isIndex, CycleNode[] chain) =>
+	int size = array.size(chain)
+	if size > 0
+		for i = 0 to size - 1
+			CycleNode node = array.get(chain, i)
+			int endBar = isRaccordo(node) and not na(node.lastValidBar) ? node.lastValidBar : i < size - 1 ? array.get(chain, i + 1).startBar : bar_index
+			float extreme = node.startPrice
+			int cappedEnd = math.min(bar_index, math.max(node.startBar, endBar))
+			if node.startBar <= cappedEnd
+				for b = math.max(node.startBar, bar_index - 5000) to cappedEnd
+					float v = sidePivotAt(isIndex, bar_index - b)
+					if not na(v)
+						extreme := isIndex ? math.min(extreme, v) : math.max(extreme, v)
+			bool displaced = isMoreExtreme(isIndex, extreme, node.startPrice)
+			float clearance = math.max(math.abs(extreme) * cfg.cycleLineClearancePct / 100.0, syminfo.mintick * 2.0)
+			float displayLevel = displaced ? extreme + (isIndex ? -clearance : clearance) : node.startPrice
+			line.set_y1(node.lnCycle, displayLevel)
+			line.set_y2(node.lnCycle, displayLevel)
+			float defaultTick = math.max(math.abs(node.startPrice) * 0.001, syminfo.mintick * 2.0)
+			line.set_y1(node.lnVert, displaced ? node.startPrice : node.startPrice - defaultTick)
+			line.set_y2(node.lnVert, displaced ? displayLevel : node.startPrice + defaultTick)
+			line.set_style(node.lnVert, displaced ? line.style_dashed : line.style_dotted)
+			float labelGap = math.max(math.abs(displayLevel) * cfg.cycleLabelGapPct / 100.0, syminfo.mintick * 2.0) * (isIndex ? 2.0 : 1.0)
+			label.set_y(node.lblInfo, displayLevel + (isIndex ? -labelGap : labelGap))
+			if cfg.cleanCycleLabels
+				label.set_style(node.lblInfo, cycleLabelStyle(cfg, isIndex))
+				label.set_textalign(node.lblInfo, text.align_left)
+method normalizeDaily(CycleNode node, EngineConfig cfg, bool isIndex) =>
+	node.isRaccordoConfirmed := false
+	node.raccType := RACC_NONE
+	node.hasAlternatives := false
+	clearAlternativeLabels(node)
+	label.set_size(node.lblInfo, size.large)
+	node.paint(cfg, isIndex ? cfg.lineColorIndex : cfg.lineColorInverse, dailyTextColor(cfg, isIndex, false), 80)
+export method clearChain(CycleNode[] chain) =>
+	if array.size(chain) > 0
+		for i = 0 to array.size(chain) - 1
+			CycleNode node = array.get(chain, i)
+			node.clearVisuals()
+		array.clear(chain)
+
+// Potatura definitiva: le transazioni con rollback mantengono i propri nodi.
+export trimChainTo(CycleNode[] chain, int keepSize) =>
+	while array.size(chain) > keepSize
+		CycleNode removed = array.pop(chain)
+		removed.clearVisuals()
+	true
+
+export clearLabelStore(label[] labels) =>
+	if array.size(labels) > 0
+		for lbl in labels
+			label.delete(lbl)
+		array.clear(labels)
+	true
+
+export clearLineStore(line[] lines) =>
+	if array.size(lines) > 0
+		for ln in lines
+			line.delete(ln)
+		array.clear(lines)
+	true
+// ==============================================================================
+// 6. FIBONACCI DEI VINCOLI
+// ==============================================================================
+// Pre-lock: esclude la prima candela rossa indice / verde inverso.
+// La candela lock resta esclusa dall'ancora, inclusa nell'invalidazione.
+export scanPreLockExtreme(bool isIndex, int startBar, int endBar) =>
+	float extreme = na
+	int extremeBar = na
+	int limitBar = na(endBar) ? na : math.min(bar_index, endBar - 1)
+	int firstBar = startBar + (getStartCountOffset(isIndex, startBar) == 0 ? 1 : 0)
+	if not na(limitBar) and limitBar >= firstBar
+		for b = firstBar to limitBar
+			int offset = bar_index - b
+			if scanOffsetOk(offset)
+				float value = oppositePivotAt(isIndex, offset)
+				if not na(value) and (na(extreme) or isMoreExtreme(isIndex, extreme, value))
+					extreme := value
+					extremeBar := b
+	[extreme, extremeBar]
+
+export clearFibObjects(line[] lines, label[] labels) =>
+	clearLineStore(lines)
+	clearLabelStore(labels)
+export fibLockColor(color base, color danger, int idx) =>
+	color accent = idx == 2 ? color.rgb(255, 209, 102) : idx == 3 ? color.rgb(190, 196, 205) : idx == 4 ? color.rgb(255, 159, 67) : idx >= 7 ? danger : base
+	int alpha = idx >= 7 ? math.max(4, 38 - (idx - 7) * 6) : idx == 0 or idx == 6 ? 12 : idx == 2 or idx == 4 ? 16 : 38
+	color.new(accent, alpha)
+// ==============================================================================
+// 7. SWING, CANDIDATI E VALIDAZIONE FREE/LOCKED
+// ==============================================================================
+// Le candele del colore di partenza valgono come prima barra del lato testato.
+export checkSwingCondition(bool isIndex, bool isLeft, int checkDelay, float target, int numToTest) =>
+	int barsOk = 0
+	bool colorOk = isIndex ? (isLeft ? close[checkDelay] < open[checkDelay] : close[checkDelay] >= open[checkDelay]) : (isLeft ? close[checkDelay] >= open[checkDelay] : close[checkDelay] < open[checkDelay])
+	if colorOk and (not isLeft or numToTest > 0)
+		barsOk += 1
+	int barsToLoop = colorOk ? numToTest - 1 : numToTest
+	if barsToLoop > 0
+		for i = 1 to barsToLoop
+			int histOffset = isLeft ? checkDelay + i : checkDelay - i
+			if histOffset < 0 or histOffset > 5000 or (isLeft and histOffset >= bar_index)
+				break
+			float v = sidePivotAt(isIndex, histOffset)
+			bool levelOk = isIndex ? v >= target : v <= target
+			if not na(v) and levelOk
+				barsOk += 1
+			else
+				break
+	barsOk >= numToTest
+
+makeCandidate(int barIdx, float price, int duration, bool leftOk, bool rightOk) =>
+	Candidate.new(barIdx, price, duration, rightOk ? 2 : leftOk ? 1 : 0, false, na, false, 0)
+scanCandidatesWithRight(EngineConfig cfg, bool isIndex, int nodeStartBar, int canonicalRightOverride) =>
+	Candidate[] list = array.new<Candidate>()
+	int startOffset = bar_index - nodeStartBar
+	float sequenceStartPrice = historyOffsetOk(startOffset) ? sidePivotAt(isIndex, startOffset) : na
+	int maxScan = 50
+	int limit = math.min(bar_index, nodeStartBar + maxScan)
+	if limit > nodeStartBar + 3
+		for b = nodeStartBar + 3 to limit
+			int offset = bar_index - b
+			if offset < 0 or offset > 5000
+				continue
+			float target = sidePivotAt(isIndex, offset)
+			if na(target)
+				continue
+			int candBar = b
+			int candOffset = offset
+			float candTarget = target
+			bool closeOnColor = isIndex ? close[offset] < open[offset] : close[offset] >= open[offset]
+			if closeOnColor and offset > 0
+				bool nextIsTrueSpike = isIndex ? close[offset - 1] >= open[offset - 1] and low[offset - 1] < target : close[offset - 1] < open[offset - 1] and high[offset - 1] > target
+				if nextIsTrueSpike
+					candBar := b + 1
+					candOffset := offset - 1
+					candTarget := sidePivotAt(isIndex, candOffset)
+			int duration = candidateDuration(cfg, isIndex, nodeStartBar, offset, target)
+			if isCanonicalClosureDuration(cfg, duration, closeOnColor) and (array.size(list) == 0 or array.last(list).barIdx != candBar)
+				int effectiveReqR = canonicalRightOverride > 0 ? canonicalRightOverride : cfg.currentCheckDelay
+				bool leftOk = checkSwingCondition(isIndex, true, candOffset, candTarget, 3)
+				bool rightOk = leftOk and checkSwingCondition(isIndex, false, candOffset, candTarget, effectiveReqR)
+				// La 23 e' una chiusura anticipata di seconda scelta: resta sopra ogni
+				// raccordo, ma non compete alla pari con il range ordinario 24+.
+				Candidate c = makeCandidate(candBar, candTarget, duration, leftOk, rightOk)
+				c.constraintOk := candidateSatisfiesConstraintAtClose(cfg, isIndex, nodeStartBar, sequenceStartPrice, candBar, candTarget)
+				array.push(list, c)
+	bool sequenceLocked = false
+	float sequenceLastLevel = sequenceStartPrice
+	float sequenceAbsolute = sequenceStartPrice
+	float sequencePrevious = na
+	bool sequencePreviousTrend = false
+	for sequenceCandidate in list
+		sequenceCandidate.levelBefore := sequenceLocked ? sequenceLastLevel : na
+		if sequenceCandidate.swingState == 2 and isValidDuration(cfg, sequenceCandidate.duration) and sequenceCandidate.duration <= cfg.cycleMaxBars
+			float sequencePrice = sequenceCandidate.price
+			bool sequenceBreakout = isMoreExtreme(isIndex, sequencePrice, sequenceStartPrice)
+			bool sequenceBeatsAbsolute = isMoreExtreme(isIndex, sequencePrice, sequenceAbsolute)
+			bool sequenceBeatsLast = isMoreExtreme(isIndex, sequencePrice, sequenceLastLevel)
+			bool sequenceBeatsPrevious = not na(sequencePrevious) and isMoreExtreme(isIndex, sequencePrice, sequencePrevious)
+			sequenceCandidate.sequenceValid := sequenceBreakout ? sequenceBeatsAbsolute or sequenceLocked and sequenceBeatsLast : sequenceLocked ? sequenceBeatsLast : true
+			if sequenceBreakout
+				if sequenceBeatsAbsolute
+					sequenceAbsolute := sequencePrice
+					sequenceLocked := true
+				sequencePreviousTrend := sequenceBeatsPrevious
+			else if not sequenceLocked and not na(sequencePrevious)
+				if sequenceBeatsPrevious and sequencePreviousTrend
+					sequenceLocked := true
+				sequencePreviousTrend := sequenceBeatsPrevious
+			if sequenceCandidate.sequenceValid
+				sequenceLastLevel := sequencePrice
+			sequencePrevious := sequencePrice
+	if array.size(list) > 1
+		int n = array.size(list)
+		for i = 0 to n - 2
+			for j = i + 1 to n - 1
+				Candidate ci = array.get(list, i)
+				Candidate cj = array.get(list, j)
+				bool ciEarly = isEarly23Duration(cfg, ci.duration)
+				bool cjEarly = isEarly23Duration(cfg, cj.duration)
+				bool jBetter = not cjEarly and ciEarly or cjEarly == ciEarly and (isMoreExtreme(isIndex, cj.price, ci.price) or cj.price == ci.price and cj.duration > ci.duration)
+				if jBetter
+					array.set(list, i, cj)
+					array.set(list, j, ci)
+	list
+
+export scanCandidates(EngineConfig cfg, bool isIndex, int nodeStartBar) =>
+	scanCandidatesWithRight(cfg, isIndex, nodeStartBar, 0)
+
+// I candidati di un nodo chiuso possono completare la propria destra in seguito.
+// La nuova scansione conserva i tentativi gia' consumati sulla stessa partenza.
+export refreshCandidatesPreservingAttempts(EngineConfig cfg, bool isIndex, CycleNode node) =>
+	Candidate[] previous = node.candidates
+	Candidate[] refreshed = scanCandidates(cfg, isIndex, node.startBar)
+	for candidate in refreshed
+		for oldCandidate in previous
+			if candidate.barIdx == oldCandidate.barIdx
+				candidate.attemptCount := oldCandidate.attemptCount
+				break
+	node.candidates := refreshed
+	true
+
+export createNode(int id, int barIdx, float price, float stateLevel, int stateBar, int rType) =>
+	Candidate[] emptyList = array.new<Candidate>()
+	label[] emptyLabels = array.new<label>()
+	CycleNode node = CycleNode.new(id, barIdx, price, emptyList, stateLevel, stateBar, false, na, false, false, rType, false, false, emptyLabels, na, na, na, na)
+	node
+confirmBisnonnoRaccordi(CycleNode[] chain) =>
+	int size = array.size(chain)
+	if size >= 3
+		int bisnonnoIdx = size - 3
+		CycleNode bisnonno = array.get(chain, bisnonnoIdx)
+		if isRaccordo(bisnonno) and not bisnonno.isRaccordoConfirmed
+			bisnonno.isRaccordoConfirmed := true
+			label.set_text(bisnonno.lblInfo, "R(" + raccText(bisnonno.raccType) + ")")
+// ==============================================================================
+// 8. RACCORDI E CONTINUITA DELLA CENTRATURA
+// ==============================================================================
+export getRaccordoType(EngineConfig cfg, int duration, int ageFromStart) =>
+	// Le soglie sono minimi inclusivi: 48 significa attivo gia' sulla barra 48.
+	int rType = RACC_INVALID
+	if duration >= cfg.raccT4MinBars and duration <= cfg.raccT4MaxBars and ageFromStart >= cfg.raccT4MinAge
+		rType := RACC_T4
+	else if duration >= raccT5MinBars and duration <= raccT5MaxBars and ageFromStart >= cfg.raccT5MinAge
+		rType := RACC_T5
+	else if duration >= raccT6MinBars and duration <= raccT6MaxBars and ageFromStart >= cfg.raccT6MinAge
+		rType := RACC_T6
+	rType
+export checkRightConditionForRaccordo(bool isIndex, int checkBar, float target, int raccType) =>
+	int reqRight = raccType == RACC_T4 ? 2 : raccType == RACC_T5 or raccType == RACC_T6 ? 1 : 0
+	int offset = bar_index - checkBar
+	historyOffsetOk(offset) and reqRight > 0 and checkSwingCondition(isIndex, false, offset, target, reqRight)
+
+export rightConditionAlive(bool isIndex, int offset, float target, int reqRight) =>
+	bool alive = true
+	bool colorCounts = isIndex ? close[offset] >= open[offset] : close[offset] < open[offset]
+	int loopMax = math.min(colorCounts ? reqRight - 1 : reqRight, offset)
+	if loopMax > 0
+		for k = 1 to loopMax
+			int histOffset = offset - k
+			bool ok = isIndex ? low[histOffset] >= target : high[histOffset] <= target
+			if not ok
+				alive := false
+				break
+	alive
+// Conta una sola volta le barre sinistre; 10/11, 5 e 2 condividono
+// lo stesso prefisso e si interrompono sul primo estremo incompatibile.
+prospectiveCloseGrade(EngineConfig cfg, bool isIndex, int offset, float target) =>
+	int validBars = 0
+	int maxBars = offset >= 0 ? math.min(cfg.t1MinBars, math.min(5000 - offset, bar_index - offset - 1)) : 0
+	if maxBars > 0
+		for i = 1 to maxBars
+			float value = sidePivotAt(isIndex, offset + i)
+			if na(value) or isMoreExtreme(isIndex, value, target)
+				break
+			validBars += 1
+	validBars >= cfg.t1MinBars ? 1 : validBars >= t2MinBars ? 2 : validBars >= t3MinBars ? 3 : 0
+prospectiveMarkerPrice(EngineConfig cfg, bool isIndex, float price, bool isText, bool isCurrentBar) =>
+	float off = cfg.prospOffsetPct + (isText ? cfg.prospTextGapPct : 0.0) + (isCurrentBar ? cfg.prospCurrentExtraPct : 0.0)
+	price * (1 + (isIndex ? -off : off) / 100)
+export markerShapeGlyph(string shape, bool isIndex) =>
+	shape == "Diamante" ? "◆" : shape == "Quadrato" ? "■" : shape == "Triangolo" ? (isIndex ? "▲" : "▼") : shape == "Croce" ? "+" : shape == "X" ? "x" : "●"
+// ==============================================================================
+// 9. VINCOLO SETTIMANALE E CANDIDATI NEW T / NEW TI
+// ==============================================================================
+weeklyRightState(EngineConfig cfg, bool isIndex, int candidateBar, float candidatePrice) =>
+	bool alive = not na(candidateBar) and not na(candidatePrice) and candidateBar < bar_index
+	int checked = 0
+	if alive
+		int lastBar = math.min(bar_index, candidateBar + cfg.newTRightBars)
+		for b = candidateBar + 1 to lastBar
+			int offset = bar_index - b
+			if offset < 0 or offset > 5000 or isMoreExtreme(isIndex, isIndex ? low[offset] : high[offset], candidatePrice)
+				alive := false
+				break
+			checked += 1
+	[alive, alive and checked >= cfg.newTRightBars]
+
+wRight(EngineConfig cfg, bool isIndex, int candidateBar, float candidatePrice) =>
+	[_, confirmed] = weeklyRightState(cfg, isIndex, candidateBar, candidatePrice)
+	confirmed
+wLeft(EngineConfig cfg, bool isIndex, int candidateBar, float candidatePrice) =>
+	bool confirmed = not na(candidateBar) and not na(candidatePrice) and candidateBar >= cfg.newTLeftBars
+	if confirmed
+		for k = 1 to cfg.newTLeftBars
+			int offset = bar_index - (candidateBar - k)
+			if offset < 0 or offset > 5000 or isMoreExtreme(isIndex, isIndex ? low[offset] : high[offset], candidatePrice)
+				confirmed := false
+				break
+	confirmed
+export isVisibleDailyNode(CycleNode node) =>
+	not isRaccordo(node) and node.raccType != RACC_RESET
+
+export weeklyOriginBar(EngineContext ctx, bool isIndex) =>
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	state.startBar
+
+export weeklyContextView(EngineContext ctx, bool isIndex, CycleNode[] chain, bool fullHistory = false) =>
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	CycleNode[] view = array.new<CycleNode>()
+	CycleNode[] history = state.weeklyHistory
+	int contextStart = fullHistory ? 0 : nz(state.weeklyContextStart, state.startBar)
+	for node in history
+		if node.startBar >= contextStart and (array.size(chain) == 0 or node.startBar < array.first(chain).startBar)
+			array.push(view, node)
+	array.concat(view, chain)
+	view
+
+weeklyTemporalNode(CycleNode node) =>
+	node.raccType == RACC_NONE or node.raccType == RACC_RESET
+
+weeklyOrdinalFrom(CycleNode[] view, int origin, int targetBar) =>
+	int ordinal = -1
+	for node in view
+		if weeklyTemporalNode(node) and node.startBar >= origin
+			if node.startBar >= targetBar
+				break
+			ordinal += 1
+	ordinal + 1
+
+weeklyWindowFrom(EngineConfig cfg, bool isIndex, int origin, int ordinal, int candidateBar) =>
+	not na(origin) and candidateBar > origin and ordinal <= 10 and (ordinal >= 6 or ordinal == 5 and cycleDurationFrom(isIndex, origin, candidateBar) >= weeklyMinCycles * cfg.cycleMinBars)
+
+export weeklyRootNode(EngineContext ctx, bool isIndex, CycleNode[] chain) =>
+	CycleNode root = na
+	if array.size(chain) > 0
+		root := array.first(chain)
+		int origin = weeklyOriginBar(ctx, isIndex)
+		for node in chain
+			if node.startBar == origin
+				root := node
+				break
+	root
+
+// ==============================================================================
+// 9.1 SWING EVOLUTI T-3 E SETTIMANALI
+// ==============================================================================
+// Ipotesi temporale v1 e metodo precedente DN: SWING-EVOLUTI.md.
+// Estremo interno del sottociclo terminale, non dell'intero ciclo contenitore.
+// La qualificazione non dipende dal lock; finestre di rottura invariate.
+evolvedT3MinDuration(EngineConfig cfg) =>
+	cfg.allow23Exception ? 23 : cfg.cycleMinBars
+
+evolvedSwing(bool isIndex, int lowerStart, int candidateBar, int deadlineBars) =>
+	float level = na
+	int levelBar = na
+	bool bounded = not na(lowerStart) and lowerStart >= 0 and lowerStart < candidateBar - 1 and candidateBar <= bar_index and bar_index - lowerStart <= 5000
+	if bounded
+		for b = lowerStart + 1 to candidateBar - 1
+			int offset = bar_index - b
+			if historyOffsetOk(offset)
+				float value = oppositePivotAt(isIndex, offset)
+				if na(value)
+					level := na
+					levelBar := na
+					break
+				if na(level) or isAtOrMoreExtreme(isIndex, level, value)
+					level := value
+					levelBar := b
+		if na(level) or not isMoreExtreme(isIndex, sidePivotOnBar(isIndex, lowerStart), level) or not isMoreExtreme(isIndex, sidePivotOnBar(isIndex, candidateBar), level)
+			level := na
+			levelBar := na
+	int brokenAt = not na(level) and deadlineBars > 0 ? firstExtremeBar(not isIndex, level, candidateBar, candidateBar + deadlineBars - 1) : na
+	[level, levelBar, na(brokenAt) ? int(na) : brokenAt - candidateBar]
+
+// EG diagnostic fragment: insert after evolvedSwing(), before the terminal resolver.
+// The first helper is the existing resolver's span predicate extracted unchanged.
+evolvedDailySpanOk(EngineConfig cfg, bool isIndex, int startBar, int endBar) =>
+	bool spanValid = false
+	if startBar >= 0 and startBar < endBar and endBar <= bar_index and bar_index - startBar <= 5000
+		for shift = 0 to 1
+			int spanOffset = bar_index - endBar + shift
+			float spanTarget = sidePivotAt(isIndex, spanOffset)
+			bool spanCloseOnColor = isIndex ? close[spanOffset] < open[spanOffset] : close[spanOffset] >= open[spanOffset]
+			bool spanTrueSpike = spanCloseOnColor and spanOffset > 0 and (isIndex ? close[spanOffset - 1] >= open[spanOffset - 1] and low[spanOffset - 1] < spanTarget : close[spanOffset - 1] < open[spanOffset - 1] and high[spanOffset - 1] > spanTarget)
+			if shift == (spanTrueSpike ? 1 : 0) and isCanonicalClosureDuration(cfg, candidateDuration(cfg, isIndex, startBar, spanOffset, spanTarget), spanCloseOnColor)
+				[spanLevel, _, _] = evolvedSwing(isIndex, startBar, endBar, 0)
+				spanValid := not na(spanLevel)
+				break
+	spanValid
+
+evolvedPrePivotReady(EngineConfig cfg, bool isIndex, int atBar) =>
+	int offset = bar_index - atBar
+	float price = historyOffsetOk(offset) ? sidePivotAt(isIndex, offset) : na
+	historyOffsetOk(offset) and not na(price) and not na(open[offset]) and not na(close[offset]) and checkSwingCondition(isIndex, true, offset, price, 3) and checkSwingCondition(isIndex, false, offset, price, cfg.currentCheckDelay)
+
+// Six accepted spans at most; each may use a raw max + 1 boundary (true spike
+// or colour offset), so the total raw lookback is 6 * (cycleMaxBars + 1).
+// Nearest qualified predecessor wins; this is diagnostic greedy reconstruction,
+// NOT the operating chain, a backtracking engine, or proof of its uniqueness.
+// Missing endpoint confirmation/history stops reconstruction; no global fallback.
+evolvedPrePivotContext(EngineConfig cfg, bool isIndex, int manualPivot) =>
+	CycleNode[] context = array.new<CycleNode>()
+	int endpoint = manualPivot
+	int firstBar = math.max(0, math.max(manualPivot - 6 * (cfg.cycleMaxBars + 1), bar_index - 5000))
+	for part = 0 to 5
+		if na(endpoint) or not evolvedPrePivotReady(cfg, isIndex, endpoint)
+			break
+		int chosen = na
+		for span = evolvedT3MinDuration(cfg) - 1 to cfg.cycleMaxBars + 1
+			int candidate = endpoint - span
+			if candidate < firstBar
+				break
+			if evolvedPrePivotReady(cfg, isIndex, candidate) and evolvedDailySpanOk(cfg, isIndex, candidate, endpoint)
+				chosen := candidate
+				break
+		if na(chosen)
+			break
+		float price = sidePivotOnBar(isIndex, chosen)
+		CycleNode prior = createNode(0, chosen, price, sidePivotOnBar(isIndex, endpoint), endpoint, RACC_NONE)
+		prior.isClosed := true
+		array.unshift(context, prior)
+		endpoint := chosen
+	context
+
+findEvolvedT5Start(bool isIndex, int candidateBar) =>
+	int centeredStart = na
+	if not na(candidateBar)
+		for rawBars = raccT5MinBars - 1 to raccT5MaxBars
+			int testBar = candidateBar - rawBars
+			int offset = bar_index - testBar
+			int duration = testBar >= 0 ? cycleDurationFrom(isIndex, testBar, candidateBar) : 0
+			if duration >= raccT5MinBars and duration <= raccT5MaxBars and historyOffsetOk(offset)
+				float testPrice = sidePivotAt(isIndex, offset)
+				if not na(testPrice) and checkSwingCondition(isIndex, true, offset, testPrice, 1) and checkSwingCondition(isIndex, false, offset, testPrice, 1)
+					[level, _, _] = evolvedSwing(isIndex, testBar, candidateBar, 0)
+					if not na(level)
+						centeredStart := testBar
+						break
+	centeredStart
+
+// Stessa chiusura canonica dello scanner, inclusa la partenza sulla true spike
+// successiva alla candela di chiusura. Nessuna condizione DX aggiunta al prospettico.
+findEvolvedTerminalStart(EngineConfig cfg, bool isIndex, CycleNode[] chain, int candidateBar, int swingKind, int tStart) =>
+	int lowerStart = na
+	int sourceCycles = swingKind == 1 ? 1 : swingKind == 2 ? 2 : 4
+	int contextCycles = swingKind == 1 ? 2 : 4
+	int count = 0
+	int endBar = candidateBar
+	bool qualified = false
+	if array.size(chain) > 0 and not na(candidateBar)
+		for i = 0 to array.size(chain) - 1
+			CycleNode node = array.get(chain, array.size(chain) - 1 - i)
+			if node.startBar > candidateBar
+				continue
+			if node.raccType != RACC_NONE
+				break
+			if node.startBar == candidateBar
+				continue
+			bool spanValid = evolvedDailySpanOk(cfg, isIndex, node.startBar, endBar)
+			if not spanValid
+				break
+			count += 1
+			if count == sourceCycles
+				lowerStart := node.startBar
+			endBar := node.startBar
+			if swingKind < 3
+				if count == contextCycles
+					qualified := true
+					break
+			else
+				if na(tStart) or node.startBar < tStart
+					break
+				if node.startBar == tStart
+					// La finestra weekly del chiamante resta sovrana: qui solo
+					// contiguita', sesto eccezionale e maturita' pura del vecchio T.
+					qualified := count >= weeklyMinCycles - 1 and cycleDurationFrom(isIndex, tStart, candidateBar) >= weeklyMinCycles * cfg.cycleMinBars
+					break
+	qualified ? lowerStart : int(na)
+
+evolvedWeeklyMinDuration(EngineConfig cfg) =>
+	weeklyMinCycles * evolvedT3MinDuration(cfg)
+
+evolvedRank(EngineConfig cfg, EngineContext ctx, bool isIndex, int lowerStart, int candidateBar, int deadlineBars, string grade) =>
+	int cachedEpoch = map.get(ctx.evolvedRankCache, "E")
+	if na(cachedEpoch) or cachedEpoch != bar_index
+		map.clear(ctx.evolvedRankCache)
+		map.put(ctx.evolvedRankCache, "E", bar_index)
+	string key = grade + (isIndex ? "I" : "V") + str.tostring(candidateBar) + ":" + str.tostring(nz(lowerStart, -1))
+	int rank = map.get(ctx.evolvedRankCache, key)
+	if na(rank)
+		int scanDeadline = cfg.showHigherAnalysis and grade == "W" ? math.max(deadlineBars, bar_index - candidateBar + 1) : deadlineBars
+		[_, _, breakBars] = evolvedSwing(isIndex, lowerStart, candidateBar, scanDeadline)
+		rank := na(breakBars) ? 0 : math.max(1, deadlineBars + 1 - breakBars)
+		map.put(ctx.evolvedRankCache, key, rank)
+	rank
+
+evolvedWeeklyRank(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] chain, int candidateBar) =>
+	// Rivalidare PRIMA della cache: a contesto non valido corrisponde start=na.
+	int lowerStart = findEvolvedTerminalStart(cfg, isIndex, chain, candidateBar, 1, weeklyOriginBar(ctx, isIndex))
+	evolvedRank(cfg, ctx, isIndex, lowerStart, candidateBar, evolvedWeeklyMinDuration(cfg), "W")
+
+// L'alternanza canonica richiede una partenza della chain opposta compresa fra
+// due partenze consecutive della chain valutata: I-V-I oppure V-I-V.
+hasCanonicalAlternation(EngineContext ctx, bool isIndex, int parentStartBar, int candidateBar) =>
+	bool found = false
+	CycleNode[] oppositeChain = sideRuntime(ctx, not isIndex).chain
+	if array.size(oppositeChain) > 0
+		for node in oppositeChain
+			if isVisibleDailyNode(node) and node.startBar > parentStartBar and node.startBar < candidateBar
+				found := true
+				break
+	found
+
+// Spareggio comune e lossless: a score topologico uguale il range ordinario
+// precede la 23; dentro lo stesso grado restano swing evoluto, alternanza e
+// infine lo spareggio storico del chiamante.
+export candidateTieBetter(EngineConfig cfg, EngineContext ctx, bool isIndex, int parentStartBar, Candidate challenger, Candidate incumbent, bool preferEarlier) =>
+	bool candidateEarly = isEarly23Duration(cfg, challenger.duration)
+	bool bestEarly = isEarly23Duration(cfg, incumbent.duration)
+	bool better = not candidateEarly and bestEarly
+	if candidateEarly == bestEarly
+		int candidateEvolvedRank = evolvedRank(cfg, ctx, isIndex, findEvolvedT5Start(isIndex, challenger.barIdx), challenger.barIdx, evolvedT3MinDuration(cfg), "3")
+		int bestEvolvedRank = evolvedRank(cfg, ctx, isIndex, findEvolvedT5Start(isIndex, incumbent.barIdx), incumbent.barIdx, evolvedT3MinDuration(cfg), "3")
+		better := candidateEvolvedRank > bestEvolvedRank
+		if candidateEvolvedRank == bestEvolvedRank
+			bool candidateAlternates = hasCanonicalAlternation(ctx, isIndex, parentStartBar, challenger.barIdx)
+			bool bestAlternates = hasCanonicalAlternation(ctx, isIndex, parentStartBar, incumbent.barIdx)
+			if candidateAlternates != bestAlternates
+				better := candidateAlternates
+			else
+				better := preferEarlier ? (challenger.barIdx < incumbent.barIdx or (challenger.barIdx == incumbent.barIdx and (isIndex ? challenger.price < incumbent.price : challenger.price > incumbent.price))) : ((isIndex ? challenger.price < incumbent.price : challenger.price > incumbent.price) or (challenger.price == incumbent.price and challenger.barIdx > incumbent.barIdx))
+	better
+
+evolvedDebugSuffix(bool isIndex, int lowerStart, int candidateBar, int deadlineBars, string grade) =>
+	[level, _, breakBars] = evolvedSwing(isIndex, lowerStart, candidateBar, deadlineBars)
+	na(level) ? "" : na(breakBars) ? "\nSE " + grade + " att." : "\nSE " + grade + " B" + str.tostring(breakBars)
+
+// Registri solo dell'ultima barra; gli oggetti restano nei normali store di cleanup.
+
+drawEvolvedSwingLine(EngineConfig cfg, EngineContext ctx, bool isIndex, int lowerStart, int candidateBar, int deadlineBars, int swingKind, bool prospective, line[] store, label[] labelStore, bool miniJ = false) =>
+	[level, levelBar, breakBars] = evolvedSwing(isIndex, lowerStart, candidateBar, deadlineBars)
+	if cfg.showEvolvedSwings and not na(level) and not na(levelBar) and not na(ctx.drawnSwingLines)
+		string key = (isIndex ? "I" : "V") + str.tostring(candidateBar) + ":" + str.tostring(levelBar)
+		line ln = map.get(ctx.drawnSwingLines, key)
+		label lbl = map.get(ctx.drawnSwingLabels, key)
+		bool fresh = na(ln) or na(lbl) or not array.includes(line.all, ln) or not array.includes(label.all, lbl)
+		string grade = swingKind == 0 ? (isIndex ? "T-3" : "T-3i") : (isIndex ? "T" : "Ti") + (swingKind == 3 ? "+2" : swingKind == 2 ? "+1" : "")
+		string sourceGrade = swingKind == 3 ? "T-1" : swingKind == 2 ? "T-2" : swingKind == 1 ? "T-3" : "T-5"
+		string caption = (miniJ ? "Mini punto J" : "Swing " + grade) + (isIndex ? " · max " : " · min ") + sourceGrade
+		string txt = fresh ? caption : str.replace_all(label.get_text(lbl), " P", "")
+		if not fresh and not str.contains(txt, caption)
+			txt += "\n" + caption
+		int styleKind = fresh ? swingKind : math.max(swingKind, map.get(ctx.drawnSwingKinds, key))
+		bool drawProspective = prospective and (fresh or str.endswith(label.get_text(lbl), " P"))
+		int mergedDeadline = cfg.showHigherAnalysis and styleKind >= 1 ? math.max(deadlineBars, bar_index - candidateBar + 1) : styleKind == 0 ? evolvedT3MinDuration(cfg) : evolvedWeeklyMinDuration(cfg) * (styleKind == 3 ? 4 : styleKind == 2 ? 2 : 1)
+		if mergedDeadline != deadlineBars
+			int mergedBreakBar = firstExtremeBar(not isIndex, level, candidateBar, candidateBar + mergedDeadline - 1)
+			breakBars := na(mergedBreakBar) ? na : mergedBreakBar - candidateBar
+		int alpha = na(breakBars) ? (drawProspective ? 82 : 68) : 92
+		int lineEnd = math.min(candidateBar + mergedDeadline - 1, bar_index + 500)
+		int labelBar = math.min(bar_index, lineEnd)
+		color swingColor = styleKind == 3 ? cfg.swingT2Color : styleKind == 2 ? cfg.swingT1Color : styleKind == 1 ? cfg.swingTColor : cfg.swingT3Color
+		if fresh
+			line.delete(ln)
+			label.delete(lbl)
+			ln := line.new(levelBar, level, lineEnd, level, xloc=xloc.bar_index, force_overlay=true)
+			lbl := label.new(labelBar, level, "", xloc=xloc.bar_index, color=color(na), style=isIndex ? label.style_label_up : label.style_none, force_overlay=true)
+			array.push(store, ln)
+			array.push(labelStore, lbl)
+			map.put(ctx.drawnSwingLines, key, ln)
+			map.put(ctx.drawnSwingLabels, key, lbl)
+		map.put(ctx.drawnSwingKinds, key, styleKind)
+		line.set_x2(ln, lineEnd)
+		line.set_color(ln, color.new(swingColor, math.max(color.t(swingColor), alpha)))
+		line.set_style(ln, na(breakBars) ? line.style_dashed : line.style_solid)
+		line.set_width(ln, styleKind + 1)
+		label.set_x(lbl, labelBar)
+		label.set_text(lbl, txt + (drawProspective ? " P" : ""))
+		label.set_textcolor(lbl, color.new(swingColor, math.max(color.t(swingColor), not na(breakBars) ? 80 : drawProspective ? 55 : 20)))
+		label.set_size(lbl, styleKind == 0 ? size.tiny : size.small)
+	true
+
+drawEvolvedT3SwingLine(EngineConfig cfg, EngineContext ctx, bool isIndex, int candidateBar, bool prospective, line[] store, label[] labelStore) =>
+	if cfg.showEvolvedSwings
+		drawEvolvedSwingLine(cfg, ctx, isIndex, findEvolvedT5Start(isIndex, candidateBar), candidateBar, evolvedT3MinDuration(cfg), 0, prospective, store, labelStore)
+	true
+
+export postLockState(bool isIndex, float startPrice, int lockBar, float preLockExtreme, int throughBar) =>
+	int brokenAt = na
+	float worstLevel = 1.0
+	int lastBar = math.min(bar_index, throughBar)
+	float denominator = startPrice - preLockExtreme
+	if not na(lockBar) and not na(preLockExtreme) and lockBar <= lastBar
+		for b = lockBar to lastBar
+			int offset = bar_index - b
+			if scanOffsetOk(offset)
+				float v = oppositePivotAt(isIndex, offset)
+				if not na(v)
+					if na(brokenAt) and isAtOrMoreExtreme(isIndex, preLockExtreme, v)
+						brokenAt := b
+					if b > lockBar and denominator != 0
+						float level = (v - preLockExtreme) / denominator
+						worstLevel := math.min(worstLevel, level)
+	[brokenAt, math.max(0.0, math.min(1.0, worstLevel))]
+
+preLockExtremeWasBroken(bool isIndex, int lockBar, float preLockExtreme, int endBar, bool closingConfirmed = false) =>
+	// PRELOCK.md: la chiusura provata non eredita l'invalidazione del nuovo ciclo.
+	int invalidationEnd = endBar - (closingConfirmed and getStartCountOffset(isIndex, endBar) > 0 ? 1 : 0)
+	[brokenAt, _] = postLockState(isIndex, preLockExtreme, lockBar, preLockExtreme, invalidationEnd)
+	not na(brokenAt)
+
+preLockInvalidatedUntil(bool isIndex, int startBar, int lockBar, int endBar, bool closingConfirmed = false) =>
+	[preLockExtreme, _] = scanPreLockExtreme(isIndex, startBar, lockBar)
+	preLockExtremeWasBroken(isIndex, lockBar, preLockExtreme, endBar, closingConfirmed)
+
+export weeklyCandidateLockBar(bool isIndex, int startBar, float startPrice) =>
+	firstExtremeBar(isIndex, startPrice, math.max(startBar + 1, bar_index - 4999), bar_index)
+weeklyClosureFrom(EngineConfig cfg, bool isIndex, CycleNode node, int origin, int ordinal, int throughBar) =>
+	// Un'apertura convertita successivamente in reset non cancella la chiusura.
+	weeklyTemporalNode(node) and weeklyWindowFrom(cfg, isIndex, origin, ordinal, node.startBar) and node.startBar + cfg.newTRightBars <= throughBar and wLeft(cfg, isIndex, node.startBar, node.startPrice) and wRight(cfg, isIndex, node.startBar, node.startPrice)
+
+// Anche il vincolo tardivo richiede una wick oltre la partenza weekly:
+// la sola progressione dei sottocicli non lo attiva. Una chiusura SX/DX
+// gia' provata non scompare quando la sua successiva apertura New T si invalida.
+// Regole ed esempi conservati in WEEKLY-RACCORDI.md, checkpoint DQ.
+weeklySequenceFrom(EngineConfig cfg, bool isIndex, CycleNode[] chain, int origin, int targetBar, float targetPrice) =>
+	float rootPrice = sidePivotOnBar(isIndex, origin)
+	int lockBar = firstExtremeBar(isIndex, rootPrice, math.max(origin + 1, bar_index - 4999), targetBar)
+	bool locked = not na(lockBar) and not preLockInvalidatedUntil(isIndex, origin, lockBar, targetBar)
+	float lastLevel = rootPrice
+	int ordinal = -1
+	if locked
+		for node in chain
+			if node.startBar >= targetBar
+				break
+			if weeklyTemporalNode(node) and node.startBar >= origin
+				ordinal += 1
+				if weeklyClosureFrom(cfg, isIndex, node, origin, ordinal, targetBar) and isMoreExtreme(isIndex, node.startPrice, lastLevel)
+					lastLevel := node.startPrice
+	not na(rootPrice) and (not locked or isMoreExtreme(isIndex, targetPrice, lastLevel))
+
+weeklyPredecessorQualified(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] view, CycleNode node) =>
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	int origin = nz(state.weeklyContextStart, state.startBar)
+	weeklyWindowFrom(cfg, isIndex, origin, weeklyOrdinalFrom(view, origin, node.startBar), node.startBar) and node.raccType == RACC_NONE and wLeft(cfg, isIndex, node.startBar, node.startPrice) and wRight(cfg, isIndex, node.startBar, node.startPrice) and weeklySequenceFrom(cfg, isIndex, view, origin, node.startBar, node.startPrice) and not preLockInvalidatedUntil(isIndex, node.startBar, weeklyCandidateLockBar(isIndex, node.startBar, node.startPrice), bar_index) and evolvedWeeklyRank(cfg, ctx, isIndex, view, node.startBar) > 0
+
+export weeklyReadingState(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] view, int startBar, float startPrice) =>
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	int origin = nz(state.weeklyContextStart, state.startBar)
+	int ordinal = weeklyOrdinalFrom(view, origin, startBar)
+	[rightAlive, dxComplete] = weeklyRightState(cfg, isIndex, startBar, startPrice)
+	int lockBar = weeklyCandidateLockBar(isIndex, startBar, startPrice)
+	bool ready = wLeft(cfg, isIndex, startBar, startPrice) and rightAlive and not preLockInvalidatedUntil(isIndex, startBar, lockBar, bar_index)
+	bool eligible = false
+	bool fallbackFound = false
+	for pass = 0 to (ready ? array.size(view) + 2 : 2)
+		CycleNode predecessor = pass >= 3 ? array.get(view, pass - 3) : na
+		int contextStart = pass == 0 ? nz(state.weeklyContextStart, state.startBar) : pass == 1 ? state.startBar : pass == 2 ? state.previousWeeklyStart : predecessor.startBar
+		int localOrdinal = pass == 0 ? ordinal : weeklyOrdinalFrom(view, contextStart, startBar)
+		bool inWindow = weeklyWindowFrom(cfg, isIndex, contextStart, localOrdinal, startBar)
+		if pass < 3 and not fallbackFound and inWindow
+			origin := contextStart
+			ordinal := localOrdinal
+			fallbackFound := true
+		if ready and inWindow and (pass < 3 or weeklyPredecessorQualified(cfg, ctx, isIndex, view, predecessor)) and weeklySequenceFrom(cfg, isIndex, view, contextStart, startBar, startPrice)
+			eligible := true
+			origin := contextStart
+			ordinal := localOrdinal
+			break
+	if eligible
+		for node in view
+			if isRaccordo(node) and node.startBar > startBar and not na(node.lastValidBar)
+				int endpoint = node.lastValidBar
+				if getRaccordoType(cfg, cycleDurationFrom(isIndex, node.startBar, endpoint), endpoint - startBar) != node.raccType
+					eligible := false
+					break
+	int rank = eligible ? evolvedWeeklyRank(cfg, ctx, isIndex, view, startBar) : 0
+	[eligible, dxComplete, rank, ordinal, origin, na(lockBar)]
+
+// Viste diagnostiche transitorie: nessuna mutazione dei nodi o della chain.
+export weeklyPointView(CycleNode[] view, int parentBar) =>
+	CycleNode[] branch = na(parentBar) ? view : array.copy(view)
+	if not na(parentBar)
+		while array.size(branch) > 0 and array.last(branch).startBar > parentBar
+			array.pop(branch)
+	branch
+
+export weeklyCandidatePoints(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] view, bool includeAlternatives = true) =>
+	map<int, int> points = map.new<int, int>()
+	for node in view
+		if isVisibleDailyNode(node) and not isWaitingDecision(node)
+			map.put(points, node.startBar, na)
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	if includeAlternatives and array.size(view) > 0
+		for i = array.size(view) - 1 to 0
+			CycleNode parent = array.get(view, i)
+			bool inWindow = false
+			bool canScan = parent.raccType == RACC_NONE and bar_index - parent.startBar < 5000
+			for contextId = 0 to array.size(view) + 2
+				if contextId >= 3 and (inWindow or not canScan)
+					break
+				CycleNode predecessor = contextId >= 3 ? array.get(view, contextId - 3) : na
+				int origin = contextId == 0 ? state.weeklyContextStart : contextId == 1 ? state.startBar : contextId == 2 ? state.previousWeeklyStart : predecessor.startBar
+				int ordinal = weeklyOrdinalFrom(view, origin, parent.startBar) + 1
+				inWindow := inWindow or weeklyWindowFrom(cfg, isIndex, origin, ordinal, parent.startBar + cfg.cycleMaxBars + 1) and (contextId < 3 or weeklyPredecessorQualified(cfg, ctx, isIndex, view, predecessor))
+			if canScan and inWindow
+				Candidate[] candidates = scanCandidates(cfg, isIndex, parent.startBar)
+				for c in candidates
+					int offset = bar_index - c.barIdx
+					bool alive = c.swingState == 2 ? c.sequenceValid : scanOffsetOk(offset) and prospectiveCloseGrade(cfg, isIndex, offset, c.price) > 0 and rightConditionAlive(isIndex, offset, c.price, cfg.currentCheckDelay)
+					if isCanonicalCandidate(cfg, c) and c.constraintOk and alive and not map.contains(points, c.barIdx)
+						map.put(points, c.barIdx, parent.startBar)
+	points
+
+export weeklyClosedBefore(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] view, int origin, int throughBar) =>
+	bool closed = false
+	int ordinal = -1
+	for node in view
+		if weeklyTemporalNode(node) and node.startBar >= origin
+			ordinal += 1
+			if node.startBar < throughBar and weeklyClosureFrom(cfg, isIndex, node, origin, ordinal, bar_index) and weeklySequenceFrom(cfg, isIndex, view, origin, node.startBar, node.startPrice)
+				closed := true
+				break
+	if not closed and not na(throughBar)
+		map<int, int> points = weeklyCandidatePoints(cfg, ctx, isIndex, view)
+		for [b, parent] in points
+			if not na(parent) and b < throughBar and b + cfg.newTRightBars <= bar_index
+				CycleNode[] branch = weeklyPointView(view, parent)
+				float price = sidePivotOnBar(isIndex, b)
+				if weeklyWindowFrom(cfg, isIndex, origin, weeklyOrdinalFrom(branch, origin, b), b) and wLeft(cfg, isIndex, b, price) and wRight(cfg, isIndex, b, price) and weeklySequenceFrom(cfg, isIndex, branch, origin, b, price)
+					closed := true
+					break
+	closed
+
+export oldWeeklyConstraintInvalidated(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state) =>
+	int lockBar = not na(state.firstLockBar) ? state.firstLockBar : state.lockCandidateBar
+	[preExtreme, _] = scanPreLockExtreme(isIndex, state.startBar, lockBar)
+	[brokenAt, _] = postLockState(isIndex, sidePivotOnBar(isIndex, state.startBar), lockBar, preExtreme, bar_index)
+	not na(brokenAt) and not weeklyClosedBefore(cfg, ctx, isIndex, weeklyContextView(ctx, isIndex, state.chain), state.startBar, brokenAt)
+
+export betterWeeklyRestart(bool isIndex, int candidateBar, int rank, int bestBar, int bestRank) =>
+	float price = sidePivotOnBar(isIndex, candidateBar)
+	rank > 0 and (na(bestBar) or rank > bestRank or rank == bestRank and (isMoreExtreme(isIndex, price, sidePivotOnBar(isIndex, bestBar)) or price == sidePivotOnBar(isIndex, bestBar) and candidateBar > bestBar))
+
+export selectWeeklyOrigin(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] chain, bool materializedOnly = false) =>
+	SideRuntime state = sideRuntime(ctx, isIndex)
+	int origin = state.startBar
+	CycleNode[] view = weeklyContextView(ctx, isIndex, chain)
+	int bestBar = na
+	int bestRank = 0
+	int bestContext = na
+	int bestParent = na
+	bool keepContext = false
+	int comparisonContext = nz(state.weeklyContextStart, state.startBar)
+	int viable = 0
+	for pass = 0 to 1
+		if pass == 1 and not (materializedOnly and nz(bestBar, origin) != origin)
+			break
+		if pass == 1
+			keepContext := weeklyOrdinalFrom(view, comparisonContext, bar_index) <= 10
+		map<int, int> points = weeklyCandidatePoints(cfg, ctx, isIndex, view, pass == 1 or not materializedOnly)
+		for [b, parent] in points
+			float price = sidePivotOnBar(isIndex, b)
+			CycleNode[] branch = weeklyPointView(view, parent)
+			[eligible, dxComplete, rank, _, contextStart, _] = weeklyReadingState(cfg, ctx, isIndex, branch, b, price)
+			if pass == 0
+				if eligible and dxComplete and rank > 0 and (na(bestContext) or contextStart > bestContext or contextStart == bestContext and betterWeeklyRestart(isIndex, b, rank, bestBar, bestRank))
+					bestBar := b
+					bestRank := rank
+					bestContext := contextStart
+					bestParent := parent
+			else if eligible and contextStart == comparisonContext
+				viable += 1
+		if pass == 1
+			keepContext := keepContext or viable > 1
+	[nz(bestBar, origin), bestContext, keepContext, bestParent]
+
+// Un R(T-4) implica spazio per un altro T-1. Dopo l'ottavo T-3 viene escluso
+// soltanto quando nessuna base settimanale ancora valida lo rende possibile;
+// l'ambiguita' della New T resta quindi informazione, non un falso veto.
+export raccordoPhaseAllowed(EngineConfig cfg, EngineContext ctx, bool isIndex, int raccType, int endBar) =>
+	bool allowed = true
+	if raccType == RACC_T4
+		CycleNode[] chain = sideRuntime(ctx, isIndex).chain
+		int origin = weeklyOriginBar(ctx, isIndex)
+		int endOrdinal = -1
+		int ordinal = -1
+		if array.size(chain) > 0
+			for node in chain
+				if isVisibleDailyNode(node) and node.startBar >= origin
+					ordinal += 1
+					if node.startBar <= endBar
+						endOrdinal := ordinal
+			allowed := endOrdinal < 0 or endOrdinal + 1 <= 8
+		if not allowed
+			CycleNode[] view = weeklyContextView(ctx, isIndex, chain)
+			map<int, int> points = weeklyCandidatePoints(cfg, ctx, isIndex, view)
+			for [b, parent] in points
+				CycleNode[] branch = weeklyPointView(view, parent)
+				[eligible, dxComplete, rank, _, _, _] = weeklyReadingState(cfg, ctx, isIndex, branch, b, sidePivotOnBar(isIndex, b))
+				if b <= endBar and eligible and dxComplete and rank > 0 and weeklyOrdinalFrom(view, b, endBar + 1) <= 8
+					allowed := true
+					break
+	allowed
+
+canConvertCurrentToRaccordo(EngineConfig cfg, EngineContext ctx, CycleNode[] chain, int raccType, int endBar, bool isIndex) =>
+	int size = array.size(chain)
+	bool prevIsRaccordo = size >= 2 ? isRaccordo(array.get(chain, size - 2)) : false
+	not prevIsRaccordo and raccordoPhaseAllowed(cfg, ctx, isIndex, raccType, endBar) and isRaccordoSpacingValid(cfg, ctx, isIndex, raccType, endBar)
+
+// Ricostruisce l'invalidazione soltanto fino alla barra richiesta. E' essenziale
+// per i gap: il massimo/minimo della candela attraversa il livello anche se
+// l'apertura non ha mai quotato esattamente sul prezzo di annullamento.
+export wouldHavePreLockInvalidation(EngineConfig cfg, bool isIndex, int candBar, float candPrice, int currentBar, bool closingConfirmed = false) =>
+	int lockBar = firstLockBarUntil(cfg, isIndex, candBar, candPrice, math.min(currentBar, candBar + cfg.cycleMinBars - 1))
+	preLockInvalidatedUntil(isIndex, candBar, lockBar, currentBar, closingConfirmed)
+
+canStartT3AfterRaccordo(EngineConfig cfg, bool isIndex, int checkBar, float target) =>
+	int offset = bar_index - checkBar
+	historyOffsetOk(offset) and checkSwingCondition(isIndex, true, offset, target, 3) and checkSwingCondition(isIndex, false, offset, target, cfg.currentCheckDelay)
+// Un restart crea un nuovo T-3 numerato, quindi deve essere una vera chiusura
+// canonica rispetto al nodo che sta resettando. La vecchia implementazione
+// trovava uno swing valido e poi arretrava all'estremo precedente senza
+// rivalidarne la sinistra: poteva produrre due T-3 a una barra di distanza.
+// Ultima uscita dal limbo dopo max + delay: non inventa una centratura su un
+// estremo qualsiasi. Riusa esclusivamente il primo candidato canonico gia
+// confermato sui due lati. Il reset 3*** segnala che la vecchia coerenza dei
+// vincoli e fallita, mentre il nuovo punto di partenza resta strutturalmente T-3.
+// ==============================================================================
+// 10. VINCOLO RETROATTIVO E BACKTRACKING
+// ==============================================================================
+// ==============================================================================
+// 10B. SIMULATORE DIAGNOSTICO: CENTRATURE CONCORRENTI E SCORE
+// ==============================================================================
+// Il simulatore legge soltanto dati storici e candidati. Non crea CycleNode,
+// non riscrive la chain e non usa i cooldown della centratura selezionata.
+export clamp01(float value) =>
+	math.max(0.0, math.min(1.0, value))
+
+// Reazione rapida, onde opposte e prosecuzione del lock condividono il budget
+// Fibonacci da 15 punti. Il close della lock-bar e' ordinato dopo il suo estremo;
+// le due wick non vengono invece usate per inferire un ordine intrabar ignoto.
+export diagnosticCandidateOk(EngineConfig cfg, Candidate c) =>
+	c.sequenceValid and isConfirmedCanonicalCandidate(cfg, c) and c.constraintOk
+
+// Una centratura alternativa resta viva oltre il massimo soltanto durante la
+// DX di una chiusura canonica gia' strutturata. Frecce, ALT e fascia safe usano
+// questa stessa predicate, quindi una partenza scaduta sparisce nello stesso
+// aggiornamento da tutti e tre i diagnostici.
+export diagnosticTailAlive(EngineConfig cfg, bool isIndex, int startBar) =>
+	int age = cycleDurationFrom(isIndex, startBar, bar_index)
+	bool alive = age >= 1 and age <= cfg.cycleMaxBars
+	if not alive and age <= cfg.cycleMaxBars + cfg.currentCheckDelay
+		Candidate[] tails = scanCandidatesWithRight(cfg, isIndex, startBar, 1)
+		for c in tails
+			int offset = bar_index - c.barIdx
+			bool fullRight = historyOffsetOk(offset) and checkSwingCondition(isIndex, false, offset, c.price, cfg.currentCheckDelay)
+			bool pendingRight = not fullRight and bar_index < c.barIdx + cfg.currentCheckDelay and historyOffsetOk(offset) and rightConditionAlive(isIndex, offset, c.price, cfg.currentCheckDelay)
+			if diagnosticCandidateOk(cfg, c) and pendingRight
+				alive := true
+				break
+	alive
+
+export makeDiagnosticScenario(EngineConfig cfg, bool isIndex, int lineageBar, int startBar, int rank, bool forcedInvalidation) =>
+	float startPrice = sidePivotOnBar(isIndex, startBar)
+	int lockBar = firstLockBarUntil(cfg, isIndex, startBar, startPrice, bar_index)
+	ConstraintScenario.new(lineageBar, startBar, lockBar, forcedInvalidation, rank, na, "")
+
+export appendUniqueDiagnosticMarker(ConstraintMarker[] markers, int lineageBar, int closeBar, int startBar, int cycleId, int rank) =>
+	int foundIdx = na
+	bool weeklyFree = na(closeBar)
+	if array.size(markers) > 0
+		for i = 0 to array.size(markers) - 1
+			ConstraintMarker marker = array.get(markers, i)
+			if marker.startBar == startBar
+				foundIdx := i
+				break
+	if na(foundIdx)
+		array.push(markers, ConstraintMarker.new(lineageBar, closeBar, startBar, cycleId, rank))
+	else
+		ConstraintMarker marker = array.get(markers, foundIdx)
+		marker.rank := math.max(marker.rank, rank)
+		if weeklyFree or na(marker.closeBar) or closeBar > marker.closeBar
+			if not weeklyFree
+				marker.closeBar := closeBar
+			marker.cycleId := cycleId
+	true
+
+applyRetroactiveConstraint(EngineConfig cfg, CycleNode node, bool isIndex, int evaluationEndBar, bool closingConfirmed = false) =>
+	[retroLocked, retroLevel, retroBar] = constraintStateUntil(cfg, isIndex, node.startBar, node.startPrice, evaluationEndBar)
+	node.preLockInvalidated := false
+	if retroLocked
+		int firstLockBar = firstLockBarUntil(cfg, isIndex, node.startBar, node.startPrice, evaluationEndBar)
+		[preLockExtreme, _] = scanPreLockExtreme(isIndex, node.startBar, firstLockBar)
+		node.isLocked := true
+		node.lastValidLevel := retroLevel
+		node.lastValidBar := retroBar
+		node.preLockExtreme := preLockExtreme
+		node.preLockInvalidated := preLockExtremeWasBroken(isIndex, firstLockBar, preLockExtreme, evaluationEndBar, closingConfirmed)
+	else
+		node.isLocked := false
+		node.preLockExtreme := na
+	true
+
+freezeConstraintAt(EngineConfig cfg, CycleNode node, bool isIndex, int endBar, bool closingConfirmed = false) =>
+	applyRetroactiveConstraint(cfg, node, isIndex, endBar, closingConfirmed)
+	if not node.preLockInvalidated
+		label.delete(node.lblInvalidation)
+		node.lblInvalidation := na
+
+export closeDailyAtCandidate(EngineConfig cfg, bool isIndex, CycleNode node, Candidate candidate, bool refreshLabel) =>
+	node.isClosed := true
+	node.normalizeDaily(cfg, isIndex)
+	freezeConstraintAt(cfg, node, isIndex, candidate.barIdx, diagnosticCandidateOk(cfg, candidate))
+	int closeOffset = bar_index - cycleCloseBarFromDuration(isIndex, node.startBar, candidate.duration)
+	line.set_x2(node.lnCycle, historyOffsetOk(closeOffset) ? time[closeOffset] : historyTimeAt(candidate.barIdx))
+	if refreshLabel
+		label.set_text(node.lblInfo, fmtLbl(isIndex, node.id, false))
+	true
+
+// Costruzione standard di un T-3: concentra solo inizializzazione e rendering,
+// lasciando invariata a ogni chiamante la scelta di barra, offset e incertezza.
+export buildDailyNode(EngineConfig cfg, int id, int barIdx, float price, bool isIndex, bool uncertain) =>
+	int timeVal = historyTimeAt(barIdx)
+	CycleNode node = createNode(id, barIdx, price, price, barIdx, RACC_NONE)
+	applyRetroactiveConstraint(cfg, node, isIndex, bar_index)
+	node.hasAlternatives := uncertain
+	color baseColor = isIndex ? cfg.lineColorIndex : cfg.lineColorInverse
+	color visibleLine = cfg.showDailyLines ? baseColor : color(na)
+	node.lnCycle := cycleHorizontal(timeVal, price, time, visibleLine)
+	node.lnVert := cycleVertical(timeVal, price, visibleLine)
+	node.lblInfo := cycleTimeLabel(cfg, isIndex, timeVal, price, fmtLbl(isIndex, id, uncertain), baseColor, dailyTextColor(cfg, isIndex, node.isLocked), size.large)
+	node
+
+continuationQuality(EngineConfig cfg, bool isIndex, int startBar, float startPrice, bool strict, Candidate[] confirmedOut = na) =>
+	int quality = 0
+	int elapsed = cycleDurationFrom(isIndex, startBar, bar_index)
+	if elapsed < cfg.cycleMaxBars
+		quality := not strict or not wouldHavePreLockInvalidation(cfg, isIndex, startBar, startPrice, bar_index) ? (elapsed >= cfg.cycleMinBars ? 2 : 1) : 0
+	// Una chiusura gia confermata conta prima del massimo, anche nel backtracking.
+	if elapsed >= cfg.cycleMinBars
+		Candidate[] candidates = scanCandidates(cfg, isIndex, startBar)
+		for c in candidates
+			bool constraintOk = isCanonicalCandidate(cfg, c) and c.constraintOk
+			bool preLockOk = constraintOk and (not strict or not wouldHavePreLockInvalidation(cfg, isIndex, startBar, startPrice, c.barIdx, diagnosticCandidateOk(cfg, c)))
+			if preLockOk and c.sequenceValid and c.swingState == 2
+				int candidateQuality = isEarly23Duration(cfg, c.duration) ? 3 : 4
+				if not na(confirmedOut)
+					array.push(confirmedOut, c)
+				if candidateQuality > quality
+					quality := candidateQuality
+				if quality == 4 and na(confirmedOut)
+					break
+			else if quality < 2 and preLockOk and c.swingState == 1 and bar_index < c.barIdx + cfg.currentCheckDelay
+				int candidateOffset = bar_index - c.barIdx
+				if historyOffsetOk(candidateOffset) and rightConditionAlive(isIndex, candidateOffset, c.price, cfg.currentCheckDelay)
+					quality := 2
+	quality
+
+bridgeEndHasViableT3(EngineConfig cfg, bool isIndex, int startBar, float startPrice) =>
+	int elapsed = cycleDurationFrom(isIndex, startBar, bar_index)
+	elapsed < cfg.cycleMaxBars or continuationQuality(cfg, isIndex, startBar, startPrice, false) > 0
+
+findRaccordoAfterCandidate(EngineConfig cfg, EngineContext ctx, bool isIndex, int candidateBar, float candidatePrice) =>
+	int weeklyStartBar = weeklyOriginBar(ctx, isIndex)
+	PossibleRaccordo best = na
+	bool rightShortOk = checkRightConditionForRaccordo(isIndex, candidateBar, candidatePrice, RACC_T5)
+	float runningExtreme = na
+	int maxRawSpan = cycleCloseBarFromDuration(isIndex, candidateBar, cfg.raccT4MaxBars) - candidateBar
+	for raccDur = 1 to maxRawSpan
+		int raccEndBar = candidateBar + raccDur
+		int endOffset = bar_index - raccEndBar
+		if endOffset < 0
+			break
+		if endOffset > 5000
+			break
+		float endPrice = sidePivotAt(isIndex, endOffset)
+		bool endpointIsExtreme = not na(endPrice) and (na(runningExtreme) or isAtOrMoreExtreme(isIndex, endPrice, runningExtreme))
+		if not na(endPrice) and (na(runningExtreme) or isMoreExtreme(isIndex, endPrice, runningExtreme))
+			runningExtreme := endPrice
+		int duration = cycleDurationFrom(isIndex, candidateBar, raccEndBar)
+		if duration >= raccT6MinBars
+			int ageAtEnd = not na(weeklyStartBar) ? raccEndBar - weeklyStartBar : raccEndBar
+			int legalType = getRaccordoType(cfg, duration, ageAtEnd)
+			bool phaseOk = legalType != RACC_INVALID and raccordoPhaseAllowed(cfg, ctx, isIndex, legalType, raccEndBar)
+			if phaseOk and rightShortOk and endpointIsExtreme and isRaccordoSpacingValid(cfg, ctx, isIndex, legalType, raccEndBar) and canStartT3AfterRaccordo(cfg, isIndex, raccEndBar, endPrice) and bridgeEndHasViableT3(cfg, isIndex, raccEndBar, endPrice)
+				best := PossibleRaccordo.new(candidateBar, raccEndBar, endPrice, legalType)
+				break
+	best
+
+// Cerca un raccordo ponte quando la chiusura canonica non ha prosecuzione valida.
+findBridgeRaccordo(EngineConfig cfg, EngineContext ctx, bool isIndex, int parentStartBar, float parentStartPrice) =>
+	ContinuationPick bridgePick = na
+	int scanFirst = cycleCloseBarFromDuration(isIndex, parentStartBar, cfg.allow23Exception ? 23 : cfg.cycleMinBars)
+	int scanLast = math.min(bar_index, cycleCloseBarFromDuration(isIndex, parentStartBar, cfg.cycleMaxBars))
+	if scanLast >= scanFirst
+		for b = scanFirst to scanLast
+			int offset = bar_index - b
+			if offset < 0 or offset > 5000
+				continue
+			float target = sidePivotAt(isIndex, offset)
+			if na(target)
+				continue
+			int canonicalDuration = candidateDuration(cfg, isIndex, parentStartBar, offset, target)
+			// Alla frontiera massima il T-3 puo' chiudere esattamente a 44/45 e
+			// lasciare al raccordo T-6/T-5/T-4 le barre successive. Il vecchio
+			// confronto stretto rendeva irraggiungibile proprio il caso iniziale
+			// senza alcuna chiusura precedente alla barra massima.
+			bool closeOnColor = isIndex ? close[offset] < open[offset] : close[offset] >= open[offset]
+			// Il raccordo puo' iniziare solo dopo una chiusura che soddisfa il
+			// vincolo storico del T-3 padre. Il raccordo successivo non sana mai
+			// retroattivamente una chiusura avvenuta dal lato sbagliato del livello.
+			if isCanonicalClosureDuration(cfg, canonicalDuration, closeOnColor) and checkSwingCondition(isIndex, true, offset, target, 3) and candidateSatisfiesConstraintAtClose(cfg, isIndex, parentStartBar, parentStartPrice, b, target)
+				PossibleRaccordo bridgeRaccordo = findRaccordoAfterCandidate(cfg, ctx, isIndex, b, target)
+				if not na(bridgeRaccordo)
+					Candidate bridgeCandidate = makeCandidate(b, target, canonicalDuration, true, false)
+					bridgeCandidate.constraintOk := true
+					bridgePick := ContinuationPick.new(bridgeCandidate, 0, 3, bridgeRaccordo.raccType, bridgeRaccordo.endBar)
+					break
+	bridgePick
+
+// Materializza un bridge gia' validato: T-3 canonico -> raccordo -> nuovo T-3.
+// Il raccordo non consuma numerazione daily; il nuovo nodo resta provvisorio
+// finche' il suo ciclo corrente non viene chiuso in modo coerente.
+appendBridgeRaccordoInternal(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] chain, ContinuationPick pick, bool rejectPreLockInvalidation) =>
+	bool applied = false
+	CycleNode curr = array.last(chain)
+	Candidate bridgeCandidate = pick.candidate
+	// Seconda barriera intenzionale: anche un candidato costruito da un ramo
+	// diverso non puo' chiudere un ciclo vincolato senza soddisfarne il livello.
+	bool parentConstraintOk = not na(bridgeCandidate) and bridgeCandidate.constraintOk and (not rejectPreLockInvalidation or not wouldHavePreLockInvalidation(cfg, isIndex, curr.startBar, curr.startPrice, bridgeCandidate.barIdx, diagnosticCandidateOk(cfg, bridgeCandidate)))
+	bool lastIsRaccordo = array.size(chain) > 0 and isRaccordo(array.last(chain))
+	if parentConstraintOk and not lastIsRaccordo and raccordoPhaseAllowed(cfg, ctx, isIndex, pick.raccType, pick.raccEndBar) and isRaccordoSpacingValid(cfg, ctx, isIndex, pick.raccType, pick.raccEndBar)
+		curr.isClosed := true
+		curr.normalizeDaily(cfg, isIndex)
+		freezeConstraintAt(cfg, curr, isIndex, bridgeCandidate.barIdx, diagnosticCandidateOk(cfg, bridgeCandidate))
+		int bridgeTime = historyTimeAt(bridgeCandidate.barIdx)
+		line.set_x2(curr.lnCycle, bridgeTime)
+		label.set_text(curr.lblInfo, fmtLbl(isIndex, curr.id, false))
+		confirmBisnonnoRaccordi(chain)
+		int nextDailyId = curr.id + 1
+		int endpointTime = historyTimeAt(pick.raccEndBar)
+		float endpointPrice = sidePivotOnBar(isIndex, pick.raccEndBar)
+		CycleNode raccordoNode = createNode(nextDailyId, bridgeCandidate.barIdx, bridgeCandidate.price, endpointPrice, pick.raccEndBar, pick.raccType)
+		color visibleLine = cfg.showRaccordoLines ? cfg.raccordoColor : color(na)
+		raccordoNode.lnCycle := cycleHorizontal(bridgeTime, bridgeCandidate.price, endpointTime, visibleLine)
+		raccordoNode.lnVert := cycleVertical(bridgeTime, bridgeCandidate.price, visibleLine)
+		raccordoNode.lblInfo := cycleTimeLabel(cfg, isIndex, bridgeTime, bridgeCandidate.price, "R(" + raccText(pick.raccType) + ")?", cfg.raccordoColor, cfg.labelColorRaccordo, size.normal)
+		raccordoNode.isClosed := true
+		array.push(chain, raccordoNode)
+		CycleNode newNode = buildDailyNode(cfg, nextDailyId, pick.raccEndBar, endpointPrice, isIndex, true)
+		array.push(chain, newNode)
+		array.clear(sideRuntime(ctx, isIndex).triedStarts)
+		applied := true
+	applied
+
+// Un pick assente richiede lo scanner DOPO il pop; un pick gia' preparato no.
+applyPrunedAncestorBridge(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, int level, ContinuationPick preparedPick) =>
+	CycleNode[] chain = state.chain
+	CycleNode removed1 = array.pop(chain)
+	CycleNode removed2 = level == 2 ? array.pop(chain) : na
+	CycleNode parent = array.last(chain)
+	ContinuationPick pick = na(preparedPick) ? findBridgeRaccordo(cfg, ctx, isIndex, parent.startBar, parent.startPrice) : preparedPick
+	bool applied = not na(pick) and appendBridgeRaccordoInternal(cfg, ctx, isIndex, chain, pick, true)
+	if applied
+		removed1.clearVisuals()
+		if not na(removed2)
+			removed2.clearVisuals()
+	else
+		if not na(removed2)
+			array.push(chain, removed2)
+		array.push(chain, removed1)
+	applied
+
+// Solo dopo il fallimento della coda e del backtracking canonico: una chiusura
+// SX T-3 + DX breve puo' maturare dopo la scelta del vecchio figlio/reset.
+// Riesamina al massimo padre/nonno, senza oltrepassare raccordi o la weekly.
+// Recupera un'origine raccordo precedente al nodo corrente senza richiedere il
+// "?" completo: bastano SX del T-3 e DX del T-5. La chain viene potata solo
+// durante la prova, cosi fase e cooldown vedono esattamente il ramo che restera'.
+// Un raccordo genera un punto T-3 sintetico sul proprio endpoint. Non serve che
+// tale barra esista tra i "?" di scanCandidates: viene validata direttamente
+// con swing T-3, prosecuzione futura, durata, eta', monotonia e cooldown.
+// Reinterpreta il nodo corrente fallito come raccordo. A differenza del vecchio
+// fallback non usa state.lastValidBar (che segue ogni nuovo minimo/massimo del
+// vincolo), ma scandisce tutti gli endpoint storici legalmente possibili.
+applyCurrentNodeRaccordo(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] chain, PossibleRaccordo raccordo, bool uncertain, string debugTag) =>
+	bool applied = false
+	if not na(raccordo)
+		CycleNode curr = array.last(chain)
+		int endTime = historyTimeAt(raccordo.endBar)
+		curr.isClosed := true
+		curr.isRaccordoConfirmed := false
+		curr.raccType := raccordo.raccType
+		curr.lastValidBar := raccordo.endBar
+		curr.lastValidLevel := raccordo.endPrice
+		line.set_x2(curr.lnCycle, endTime)
+		string raccordoText = "R(" + raccText(raccordo.raccType) + ")" + (uncertain ? "?" : "")
+		if cfg.debugMode and debugTag != ""
+			raccordoText += "\n" + debugTag
+		label.set_text(curr.lblInfo, raccordoText)
+		curr.paint(cfg, cfg.raccordoColor, cfg.labelColorRaccordo, 80)
+		CycleNode newNode = buildDailyNode(cfg, curr.id, raccordo.endBar, raccordo.endPrice, isIndex, uncertain)
+		array.push(chain, newNode)
+		array.clear(sideRuntime(ctx, isIndex).triedStarts)
+		applied := true
+	applied
+
+// Qualita' della prosecuzione vista dallo start ipotetico:
+// 4 = chiusura ordinaria 24+ confermata, 3 = chiusura anticipata 23 confermata,
+// 2 = T-3 vivo e gia' maturo, 1 = vivo ma sotto il minimo, 0 = invalido.
+// La distinzione 2/1 evita che un secondo "?" piu recente faccia perdere uno
+// start precedente; la distinzione 4/3 propaga il minor peso della 23 anche al
+// ciclo figlio invece di giudicare soltanto la chiusura corrente.
+// Confronta topologie dirette, a un raccordo e a due raccordi senza confonderle:
+// DIRECT: il candidato e' il nuovo T-3.
+// IMMEDIATE_RACC: il candidato apre un raccordo e il suo endpoint e' il T-3 sintetico.
+// BRIDGE: dopo il candidato nasce un T-3, poi un raccordo e un altro T-3.
+// A pari qualita' vince la topologia piu' canonica; un ramo confermato batte
+// sempre un ramo soltanto prospettico, anche se usa un raccordo.
+export candidateContinuationPick(EngineConfig cfg, EngineContext ctx, bool isIndex, Candidate candidate) =>
+	int startBar = candidate.barIdx
+	float startPrice = candidate.price
+	int directQuality = 0
+	Candidate[] directClosures = array.new<Candidate>()
+	int bestTailPenalty = 100
+	int leg = 0
+	// Stesso scanner: confronta le code canoniche prima di ricorrere ai raccordi.
+	while leg <= array.size(directClosures)
+		Candidate child = leg > 0 ? array.get(directClosures, leg - 1) : na
+		if leg == 0 or (isEarly23Duration(cfg, child.duration) ? 3 : 4) == directQuality
+			int quality = continuationQuality(cfg, isIndex, leg == 0 ? startBar : child.barIdx, leg == 0 ? startPrice : child.price, true, leg == 0 ? directClosures : na)
+			if leg == 0
+				directQuality := quality
+			else
+				int tailPenalty = quality == 3 ? 25 : quality == 0 ? 50 : 0
+				if tailPenalty < bestTailPenalty
+					bestTailPenalty := tailPenalty
+				if bestTailPenalty == 0
+					break
+		leg += 1
+	PossibleRaccordo immediateRaccordo = na
+	int immediateQuality = 0
+	int immediateSecondBridgeQuality = 0
+	int bridgeQuality = 0
+	int bridgeSecondBridgeQuality = 0
+	// Prima raccordo immediato e sua coda, poi bridge e sua coda; un ramo
+	// diretto gia' confermato continua a evitare tutti gli scanner dei raccordi.
+	for path = 0 to 1
+		if directQuality < 3 and (path == 0 or immediateQuality < 3)
+			bool available = false
+			int raccordoType = RACC_NONE
+			int endBar = na
+			float endPrice = na
+			if path == 0
+				immediateRaccordo := findRaccordoAfterCandidate(cfg, ctx, isIndex, startBar, startPrice)
+				available := not na(immediateRaccordo)
+				if available
+					raccordoType := immediateRaccordo.raccType
+					endBar := immediateRaccordo.endBar
+					endPrice := immediateRaccordo.endPrice
+			else
+				ContinuationPick bridgePick = findBridgeRaccordo(cfg, ctx, isIndex, startBar, startPrice)
+				available := not na(bridgePick) and not wouldHavePreLockInvalidation(cfg, isIndex, startBar, startPrice, bridgePick.candidate.barIdx)
+				if available
+					raccordoType := bridgePick.raccType
+					endBar := bridgePick.raccEndBar
+					endPrice := sidePivotOnBar(isIndex, endBar)
+			if available
+				int quality = continuationQuality(cfg, isIndex, endBar, endPrice, true)
+				int secondQuality = 0
+				if quality < 3
+					ContinuationPick secondBridgePick = findBridgeRaccordo(cfg, ctx, isIndex, endBar, endPrice)
+					int secondDistance = not na(secondBridgePick) ? secondBridgePick.raccEndBar - endBar : 0
+					bool pairSpacingOk = secondDistance > 0
+					if pairSpacingOk and secondBridgePick.raccType == RACC_T6
+						pairSpacingOk := secondDistance >= cfg.raccT6MinAge
+					else if pairSpacingOk and secondBridgePick.raccType == RACC_T5 and (raccordoType == RACC_T5 or raccordoType == RACC_T4)
+						pairSpacingOk := secondDistance >= cfg.raccT5MinAge
+					else if pairSpacingOk and secondBridgePick.raccType == RACC_T4 and (raccordoType == RACC_T5 or raccordoType == RACC_T4)
+						pairSpacingOk := secondDistance >= cfg.raccT4MinAge
+					if pairSpacingOk and not wouldHavePreLockInvalidation(cfg, isIndex, endBar, endPrice, secondBridgePick.candidate.barIdx)
+						secondQuality := continuationQuality(cfg, isIndex, secondBridgePick.raccEndBar, sidePivotOnBar(isIndex, secondBridgePick.raccEndBar), true)
+				if path == 0
+					immediateQuality := quality
+					immediateSecondBridgeQuality := secondQuality
+				else
+					bridgeQuality := quality
+					bridgeSecondBridgeQuality := secondQuality
+	int score = directQuality >= 3 ? 600 - (directQuality == 3 ? 25 : 0) : directQuality == 2 ? 400 : directQuality == 1 ? 375 : 0
+	if directQuality >= 3
+		// Se lo start prodotto dal figlio non ha una prosecuzione diretta valida,
+		// il ramo contiene di fatto un raccordo/reset al secondo passo.
+		score -= bestTailPenalty < 100 ? bestTailPenalty : 0
+	int mode = directQuality > 0 ? 1 : 0
+	for topology = 0 to 3
+		int quality = topology == 0 ? immediateQuality : topology == 1 ? bridgeQuality : topology == 2 ? immediateSecondBridgeQuality : bridgeSecondBridgeQuality
+		int confirmedScore = topology == 0 ? 550 : topology == 1 ? 500 : topology == 2 ? 450 : 425
+		int matureScore = topology == 0 ? 350 : topology == 1 ? 300 : topology == 2 ? 275 : 250
+		int earlyScore = topology == 0 ? 325 : topology == 1 ? 285 : topology == 2 ? 260 : 235
+		int pathScore = quality >= 3 ? confirmedScore - (quality == 3 ? 25 : 0) : quality == 2 ? matureScore : quality == 1 ? earlyScore : 0
+		if pathScore > score
+			score := pathScore
+			mode := topology == 0 or topology == 2 ? 2 : 3
+	// I gradini fra DIRECT e IMMEDIATE_RACC valgono 50 punti. Sottrarne 25
+	// colloca la 23 esattamente in mezzo: 24+ diretto > 23 diretto > raccordo,
+	// conservando pero' la priorita' di un ramo confermato su uno solo ipotetico.
+	if score > 0 and isEarly23Duration(cfg, candidate.duration)
+		score -= 25
+	ContinuationPick.new(candidate, score, mode, not na(immediateRaccordo) ? immediateRaccordo.raccType : RACC_NONE, not na(immediateRaccordo) ? immediateRaccordo.endBar : na)
+
+// Policy: 0 corrente, 1 padre Case1, 2 backtracking, 3 esistenza sul padre.
+// Solo BT usa memo/fallback; il caso 3 termina al primo candidato utilizzabile.
+export selectContinuationPick(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode parent, int policy, bool preLockConfirmsRight, int childStart, PossibleRaccordo[] fallbackRaccordi) =>
+	ContinuationPick bestPick = na
+	int bestConfirmation = 0
+	for candidate in parent.candidates
+		int confirmation = candidate.sequenceValid and isConfirmedCanonicalCandidate(cfg, candidate) ? 2 : preLockConfirmsRight and isLeftCanonicalCandidate(cfg, candidate) and candidate.barIdx == parent.lastValidBar ? 1 : 0
+		bool timelineOk = not preLockConfirmsRight or (candidate.barIdx < bar_index and not wouldHavePreLockInvalidation(cfg, isIndex, parent.startBar, parent.startPrice, candidate.barIdx, diagnosticCandidateOk(cfg, candidate)))
+		if confirmation > 0 and timelineOk and candidate.constraintOk and (policy != 3 or candidate.barIdx != childStart)
+			ContinuationPick pick = candidateContinuationPick(cfg, ctx, isIndex, candidate)
+			bool memoBlocked = policy == 2 and array.includes(sideRuntime(ctx, isIndex).triedStarts, getMemoKey(candidate.barIdx, parent.id, parent.isLocked))
+			bool allowed = policy > 0 and pick.mode == 2 or candidate.attemptCount < 3 and (policy != 2 or candidate.barIdx != childStart and not memoBlocked)
+			if allowed and pick.score > 0
+				bool pickBetter = confirmation > bestConfirmation
+				if not pickBetter and confirmation == bestConfirmation
+					pickBetter := na(bestPick)
+					if not pickBetter
+						if pick.score != bestPick.score
+							pickBetter := pick.score > bestPick.score
+						else
+							pickBetter := candidateTieBetter(cfg, ctx, isIndex, parent.startBar, candidate, bestPick.candidate, policy > 0 or parent.isLocked)
+				if pickBetter
+					bestPick := pick
+					bestConfirmation := confirmation
+					if policy == 3
+						break
+			else if policy == 2 and pick.score <= 0
+				int raccDuration = cycleDurationFrom(isIndex, candidate.barIdx, bar_index)
+				int raccType = getRaccordoType(cfg, raccDuration, bar_index - weeklyOriginBar(ctx, isIndex))
+				if raccType != RACC_INVALID
+					PossibleRaccordo pr = PossibleRaccordo.new(candidate.barIdx, bar_index, candidate.price, raccType)
+					array.push(fallbackRaccordi, pr)
+				do_markAsTried(sideRuntime(ctx, isIndex).triedStarts, candidate.barIdx, parent.id, parent.isLocked)
+	bestPick
+
+// ==============================================================================
+// 11. RECOVERY DOPO RESET RIPETUTI
+// ==============================================================================
+// La recovery usa lo stesso ranking topology-aware del backtracking. Restituire
+// solo il punteggio era lossful: un candidato valido grazie a IMMEDIATE_RACC
+// veniva poi materializzato come semplice T-3, perdendo il raccordo che lo
+// rendeva valido e creando code anomale molto oltre la durata massima.
+markDx5RecoveryNode(EngineConfig cfg, CycleNode node, bool isIndex) =>
+	node.raccType := RACC_RECOVERY
+	color recoveryColor = isIndex ? emergencyRecoveryIndexColor : emergencyRecoveryInverseColor
+	string recoveryText = addDoubleLockBolt(fmtLbl(isIndex, node.id, true))
+	label.set_text(node.lblInfo, cfg.debugMode ? "DX5\n" + recoveryText : recoveryText)
+	node.paint(cfg, recoveryColor, dailyTextColor(cfg, isIndex, true), 55)
+	true
+
+// ==============================================================================
+// 12. RIPARAZIONE CANONICA DELLA CODA
+// ==============================================================================
+// Il vecchio settimanale resta disegnato ma esce dalla chain operativa. In
+// questo modo backtracking, recovery e countdown non attraversano due epoche.
+// Il 12esimo e' l'unica estensione ammessa. Un eventuale 13esimo viene
+// smaterializzato e resta come candidato della coda aperta, finche' una New T
+// completa non permette il rebase.
+// Un ramo valido con raccordo non genera Failure, quindi il backtracking
+// ordinario non rivaluterebbe mai una vecchia chiusura a 23. Quando la chain ha
+// gia' dimostrato [padre -> figlio -> R -> nuovo daily], confronta nuovamente i
+// candidati del padre con tutto il futuro ora disponibile. Ricentra soltanto su
+// una prosecuzione DIRECT strettamente migliore; non sostituisce un raccordo
+// necessario con un'altra topologia altrettanto complessa.
+// Stessa sequenza per Case1 e ricentraggio opposto; precondizioni e coda del
+// recupero restano nei chiamanti. Il flag conserva soltanto i testi debug.
+export resolveLocalLockedRaccordo(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, bool oppositeDebug) =>
+	CycleNode[] chain = state.chain
+	CycleNode curr = array.last(chain)
+	int earlierEndBar = curr.lastValidBar
+	float earlierEndPrice = curr.lastValidLevel
+	bool applied = false
+	int earlierChainSize = array.size(chain)
+	int earlierCurrentStart = earlierChainSize > 0 ? array.last(chain).startBar : na
+	bool earlierEndpointOk = earlierChainSize >= 2 and not na(earlierEndBar) and not na(earlierEndPrice) and canStartT3AfterRaccordo(cfg, isIndex, earlierEndBar, earlierEndPrice) and bridgeEndHasViableT3(cfg, isIndex, earlierEndBar, earlierEndPrice)
+	for earlierLevel = 1 to 2
+		int earlierParentPos = earlierChainSize - earlierLevel - 1
+		if not applied and earlierEndpointOk and earlierParentPos >= 0
+			CycleNode earlierParent = array.get(chain, earlierParentPos)
+			int earlierFirstBar = cycleCloseBarFromDuration(isIndex, earlierParent.startBar, cfg.allow23Exception ? 23 : cfg.cycleMinBars)
+			int earlierLastBar = math.min(earlierCurrentStart - 1, cycleCloseBarFromDuration(isIndex, earlierParent.startBar, cfg.cycleMaxBars))
+			bool earlierPathOk = earlierLevel == 1 or array.get(chain, earlierParentPos + 1).raccType == RACC_NONE
+			if earlierParent.raccType == RACC_NONE and earlierPathOk and earlierLastBar >= earlierFirstBar
+				for earlierBar = earlierFirstBar to earlierLastBar
+					if applied
+						break
+					int earlierOffset = bar_index - earlierBar
+					float earlierStartPrice = historyOffsetOk(earlierOffset) ? sidePivotAt(isIndex, earlierOffset) : na
+					int earlierParentDuration = na(earlierStartPrice) ? 0 : candidateDuration(cfg, isIndex, earlierParent.startBar, earlierOffset, earlierStartPrice)
+					bool earlierCloseOnColor = not na(earlierStartPrice) and (isIndex ? close[earlierOffset] < open[earlierOffset] : close[earlierOffset] >= open[earlierOffset])
+					bool earlierOriginOk = isCanonicalClosureDuration(cfg, earlierParentDuration, earlierCloseOnColor) and checkSwingCondition(isIndex, true, earlierOffset, earlierStartPrice, 3) and checkRightConditionForRaccordo(isIndex, earlierBar, earlierStartPrice, RACC_T5) and candidateSatisfiesConstraintAtClose(cfg, isIndex, earlierParent.startBar, earlierParent.startPrice, earlierBar, earlierStartPrice)
+					int earlierRaccType = earlierOriginOk ? getRaccordoType(cfg, cycleDurationFrom(isIndex, earlierBar, earlierEndBar), earlierEndBar - state.startBar) : RACC_INVALID
+					if earlierRaccType != RACC_INVALID and na(firstExtremeBar(isIndex, earlierEndPrice, earlierBar + 1, earlierEndBar - 1))
+						Candidate earlierOrigin = makeCandidate(earlierBar, earlierStartPrice, earlierParentDuration, true, false)
+						earlierOrigin.constraintOk := true
+						ContinuationPick earlierPick = ContinuationPick.new(earlierOrigin, 0, 3, earlierRaccType, earlierEndBar)
+						applied := applyPrunedAncestorBridge(cfg, ctx, isIndex, state, earlierLevel, earlierPick)
+	if not applied
+		PossibleRaccordo currentRaccordo = findRaccordoAfterCandidate(cfg, ctx, isIndex, curr.startBar, curr.startPrice)
+		if not na(currentRaccordo) and not canConvertCurrentToRaccordo(cfg, ctx, chain, currentRaccordo.raccType, currentRaccordo.endBar, isIndex)
+			currentRaccordo := na
+		if not na(currentRaccordo)
+			applied := applyCurrentNodeRaccordo(cfg, ctx, isIndex, chain, currentRaccordo, true, "CURRENT B" + str.tostring(cycleDurationFrom(isIndex, currentRaccordo.startBar, currentRaccordo.endBar)))
+			if applied and oppositeDebug and cfg.debugMode
+				int raccDuration = cycleDurationFrom(isIndex, currentRaccordo.startBar, currentRaccordo.endBar)
+				label.set_text(curr.lblInfo, "R(" + raccText(currentRaccordo.raccType) + ")?\nCURRENT B" + str.tostring(raccDuration) + "\nOPP NEWER")
+	if not applied
+		ContinuationPick bridgePick = findBridgeRaccordo(cfg, ctx, isIndex, curr.startBar, curr.startPrice)
+		if not na(bridgePick)
+			applied := appendBridgeRaccordoInternal(cfg, ctx, isIndex, chain, bridgePick, true)
+			if applied and oppositeDebug and cfg.debugMode and array.size(chain) >= 2
+				CycleNode bridgeNode = array.get(chain, array.size(chain) - 2)
+				label.set_text(bridgeNode.lblInfo, "R(" + raccText(bridgePick.raccType) + ")?\nOPP NEWER")
+	applied
+
+// Il lock opposto piu recente non cancella quello vecchio. Lo usa come trigger
+// per rivalutare la centratura piu anziana, applicando soltanto topologie gia'
+// dimostrate: current=raccordo oppure T-3+raccordo+T-3.
+// Se i due T-3 correnti sono entrambi vincolati in direzioni opposte, il primo
+// lock cronologico e' quello da riesaminare. A parita' di barra non c'e' winner.
+renderConfirmedAlternative(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, CycleNode node, Candidate candidate) =>
+	if candidate.sequenceValid
+		if cfg.showEvolvedSwings
+			drawEvolvedT3SwingLine(cfg, ctx, isIndex, candidate.barIdx, false, state.swingLines, node.alternativeLabels)
+		if cfg.showGhosts
+			bool lockedBefore = not na(candidate.levelBefore)
+			string alternativeLabel = lockedBefore ? "?V" : "?"
+			if cfg.debugMode
+				bool closureOk = node.isLocked ? isAtOrMoreExtreme(isIndex, candidate.price, node.lastValidLevel) : true
+				bool breakout = isMoreExtreme(isIndex, candidate.price, node.startPrice)
+				string dir = isIndex ? "<" : ">"
+				string lockText = node.isLocked ? "V:" + str.tostring(node.lastValidLevel, "#.##") : "NV"
+				string sequenceState = lockedBefore ? "L" : "F"
+				string why = breakout ? "BRK " + dir + str.tostring(node.startPrice, "#.##") : lockedBefore ? "MON " + dir + str.tostring(candidate.levelBefore, "#.##") : "FREE"
+				alternativeLabel += "\nC" + str.tostring(node.id) + " B" + str.tostring(candidate.duration) + "\nP:" + str.tostring(candidate.price, "#.##") + " " + lockText + (closureOk ? " OK " : " NO ") + sequenceState + "\n" + why + evolvedDebugSuffix(isIndex, findEvolvedT5Start(isIndex, candidate.barIdx), candidate.barIdx, evolvedT3MinDuration(cfg), "T-5")
+			color alternativeColor = lockedBefore ? color.red : cfg.ghostColor
+			label labelValue = pivotTimeLabel(isIndex, historyTimeAt(candidate.barIdx), candidate.price, alternativeLabel, color.new(alternativeColor, 70), alternativeColor, cfg.debugMode ? size.large : size.normal)
+			array.push(node.alternativeLabels, labelValue)
+			if cfg.debugMode
+				PossibleRaccordo raccordo = findRaccordoAfterCandidate(cfg, ctx, isIndex, candidate.barIdx, candidate.price)
+				if not na(raccordo)
+					string txt = "?R\n" + raccText(raccordo.raccType) + " B" + str.tostring(cycleDurationFrom(isIndex, raccordo.startBar, raccordo.endBar)) + " -> T-3"
+					int endpointTime = historyTimeAt(raccordo.endBar)
+					label lbl = pivotTimeLabel(isIndex, endpointTime, raccordo.endPrice, txt, color.new(cfg.raccordoColor, 65), cfg.labelColorRaccordo, size.normal)
+					array.push(node.alternativeLabels, lbl)
+	true
+
+// Policy commit: 0 Case1, 1 backtracking, 2 nodo corrente. Le differenze di
+// ordine restano esplicite per non cambiare snapshot, cleanup o scansioni.
+materializeContinuationPick(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, ContinuationPick pick, int commitPolicy) =>
+	CycleNode[] chain = state.chain
+	CycleNode parent = array.last(chain)
+	Candidate candidate = pick.candidate
+	bool immediateApplied = false
+	if pick.mode == 2 and pick.raccType != RACC_NONE and not na(pick.raccEndBar)
+		immediateApplied := appendBridgeRaccordoInternal(cfg, ctx, isIndex, chain, pick, true)
+		if immediateApplied
+			CycleNode syntheticT3 = array.last(chain)
+			syntheticT3.candidates := scanCandidates(cfg, isIndex, syntheticT3.startBar)
+			array.clear(state.triedStarts)
+	if not immediateApplied
+		if commitPolicy == 2
+			int alternativeCount = 0
+			for c in parent.candidates
+				bool constraintOk = c.constraintOk
+				if isConfirmedCanonicalCandidate(cfg, c) and c.barIdx != candidate.barIdx and constraintOk
+					alternativeCount += 1
+			closeDailyAtCandidate(cfg, isIndex, parent, candidate, true)
+			int chainSizeNow = array.size(chain)
+			if chainSizeNow >= 3
+				CycleNode bisnonno = array.get(chain, chainSizeNow - 3)
+				clearAlternativeLabels(bisnonno)
+				bisnonno.hasAlternatives := false
+				if not isRaccordo(bisnonno)
+					label.set_text(bisnonno.lblInfo, fmtLbl(isIndex, bisnonno.id, false))
+			confirmBisnonnoRaccordi(chain)
+			array.clear(state.triedStarts)
+			CycleNode newNode = buildDailyNode(cfg, parent.id + 1, candidate.barIdx, candidate.price, isIndex, alternativeCount > 0)
+			array.push(chain, newNode)
+		else
+			CycleNode child = buildDailyNode(cfg, parent.id + 1, candidate.barIdx, candidate.price, isIndex, true)
+			closeDailyAtCandidate(cfg, isIndex, parent, candidate, commitPolicy == 1)
+			array.push(chain, child)
+			child.candidates := scanCandidates(cfg, isIndex, child.startBar)
+			array.clear(state.triedStarts)
+	immediateApplied
+
+// ============================================================================== 
+// 13. MOTORE GIORNALIERO COMPATTO
+// ==============================================================================
+// Motore giornaliero condiviso. `isIdx=true` lavora sui low; `false` sui high.
+// Le due chain e i rispettivi registri restano indipendenti.
+export processChain(EngineConfig cfg, EngineContext ctx, bool isIdx, SideRuntime runtime) =>
+	CycleNode[] chain = runtime.chain
+	int startBar = runtime.startBar
+	bool nxtAlert = runtime.preLockAlert
+	string[] triedStarts = runtime.triedStarts
+	line[] swingLines = runtime.swingLines
+	label[] ghostLabels = runtime.ghostLabels
+	label[] newTLabels = runtime.newTLabels
+	if array.size(chain) > 0 and not na(startBar)
+		CycleNode curr = array.last(chain)
+		if not curr.isClosed
+			float currentSidePivot = sidePivot(isIdx)
+			float currentOppositePivot = isIdx ? high : low
+			line.set_x2(curr.lnCycle, time)
+			bool currentAfterWeeklyLockIndex = runtime.weeklyLocked and (curr.id == 0 or (not na(runtime.lockCandidateBar) and curr.startBar >= runtime.lockCandidateBar))
+			color activeIndexColor = curr.raccType == RACC_RESET ? specialResetColor : (curr.raccType == RACC_RECOVERY ? (isIdx ? emergencyRecoveryIndexColor : emergencyRecoveryInverseColor) : (currentAfterWeeklyLockIndex ? (isIdx ? cfg.weeklyIndexColor : cfg.weeklyInverseColor) : (curr.isLocked ? (isIdx ? cfg.lineColorIndexLocked : cfg.lineColorInverseLocked) : (isIdx ? cfg.lineColorIndex : cfg.lineColorInverse))))
+			curr.paint(cfg, activeIndexColor, isRaccordo(curr) ? cfg.labelColorRaccordo : dailyTextColor(cfg, isIdx, curr.isLocked), 80)
+			int duration = cycleDurationFrom(isIdx, curr.startBar, bar_index)
+			// Il flag sopravvive a qualsiasi ricostruzione: un rimbalzo successivo
+			// non puo' cancellare il gap che aveva gia' oltrepassato l'annullamento.
+			bool preLockInvalidation = curr.preLockInvalidated
+			if not curr.isLocked
+				bool locksNow = duration < cfg.cycleMinBars and isMoreExtreme(isIdx, currentSidePivot, curr.startPrice)
+				if locksNow
+					[preExtreme, _] = scanPreLockExtreme(isIdx, curr.startBar, bar_index)
+					curr.preLockExtreme := preExtreme
+					curr.isLocked := true
+					curr.lastValidLevel := currentSidePivot
+					curr.lastValidBar := bar_index
+				else if (bar_index > curr.startBar or getStartCountOffset(isIdx, curr.startBar) > 0) and (na(curr.preLockExtreme) or isMoreExtreme(isIdx, curr.preLockExtreme, currentOppositePivot))
+					curr.preLockExtreme := currentOppositePivot
+			else
+				if isMoreExtreme(isIdx, currentSidePivot, curr.lastValidLevel)
+					curr.lastValidLevel := currentSidePivot
+					curr.lastValidBar := bar_index
+			if curr.isLocked and not na(curr.preLockExtreme) and isAtOrMoreExtreme(isIdx, curr.preLockExtreme, currentOppositePivot)
+				preLockInvalidation := true
+				curr.preLockInvalidated := true
+				if na(curr.lblInvalidation) and not nxtAlert
+					nxtAlert := true
+					string invInfo = "INV" + str.tostring(curr.id + 1)
+					label.delete(curr.lblInvalidation)
+					curr.lblInvalidation := pivotTimeLabel(false, time, currentSidePivot, invInfo, color.new(specialResetColor, 55), specialResetColor, cfg.debugMode ? size.normal : size.tiny)
+			if duration >= cfg.cycleMinBars - 1 and duration <= cfg.cycleMaxBars + cfg.currentCheckDelay
+				curr.candidates := scanCandidates(cfg, isIdx, curr.startBar)
+			if barstate.islast
+				clearLineStore(swingLines)
+				clearAlternativeLabels(curr)
+				clearLabelStore(ghostLabels)
+				int[] confirmedBars = array.new<int>()
+				int[] prospectiveBars = array.new<int>()
+				for c in curr.candidates
+					// I candidati impossibili per il vincolo restano nella lista per il
+					// backtracking, ma non vengono presentati come chiusure disponibili.
+					bool constraintOk = c.constraintOk
+					bool canonicalDurationOk = isCanonicalCandidate(cfg, c)
+					bool candidateStructOk = canonicalDurationOk and constraintOk
+					if c.swingState == 2 and candidateStructOk
+						array.push(confirmedBars, c.barIdx)
+					if c.swingState < 2 and candidateStructOk
+						int prospOffset = bar_index - c.barIdx
+						if historyOffsetOk(prospOffset) and prospectiveCloseGrade(cfg, isIdx, prospOffset, c.price) > 0 and rightConditionAlive(isIdx, prospOffset, c.price, cfg.currentCheckDelay)
+							if not array.includes(confirmedBars, c.barIdx)
+								array.push(prospectiveBars, c.barIdx)
+				for c in curr.candidates
+					if isCanonicalCandidate(cfg, c)
+						// In un T-3 gia' vincolato una SX giornaliera con la sola DX
+						// breve T-5 puo' ancora essere l'origine di un raccordo. Mostra
+						// il suo swing in Debug view senza promuoverla a chiusura T-3.
+						bool lockedSwing = cfg.showEvolvedSwings and curr.isLocked and not preLockInvalidation and c.swingState >= 1 and c.constraintOk and (c.swingState == 2 or checkRightConditionForRaccordo(isIdx, c.barIdx, c.price, RACC_T5))
+						int prospOffset = na
+						int prospGrade = 0
+						bool prospectiveAlive = false
+						if c.swingState < 2 and array.includes(prospectiveBars, c.barIdx) and not array.includes(prospectiveBars, c.barIdx + 1)
+							prospOffset := bar_index - c.barIdx
+							prospGrade := historyOffsetOk(prospOffset) ? prospectiveCloseGrade(cfg, isIdx, prospOffset, c.price) : 0
+							prospectiveAlive := prospGrade > 0 and rightConditionAlive(isIdx, prospOffset, c.price, cfg.currentCheckDelay)
+						if lockedSwing or prospectiveAlive
+							drawEvolvedT3SwingLine(cfg, ctx, isIdx, c.barIdx, true, swingLines, ghostLabels)
+						if c.swingState == 2 and c.duration <= cfg.cycleMaxBars
+							if array.includes(confirmedBars, c.barIdx) and not array.includes(confirmedBars, c.barIdx + 1)
+								renderConfirmedAlternative(cfg, ctx, isIdx, runtime, curr, c)
+						else if c.swingState < 2 and prospectiveAlive and cfg.showGhosts
+							int prospectiveTime = historyTimeAt(c.barIdx)
+							bool prospectiveCurrent = c.barIdx == bar_index
+							color prospectiveColor = prospGrade == 1 ? cfg.prospT1Color : prospGrade == 2 ? cfg.prospT2Color : cfg.prospT3Color
+							if cfg.prospShowShape
+								string glyph = markerShapeGlyph(cfg.prospMarkerShape, isIdx)
+								label shapeLbl = plainTimeLabel(prospectiveTime, prospectiveMarkerPrice(cfg, isIdx, c.price, false, prospectiveCurrent), glyph, prospectiveColor, cfg.prospMarkerSize == "Large" ? size.large : cfg.prospMarkerSize == "Normal" ? size.normal : cfg.prospMarkerSize == "Small" ? size.small : size.tiny)
+								array.push(ghostLabels, shapeLbl)
+							string prospectiveText = cfg.prospShowText ? (prospGrade == 1 ? "T-1" : prospGrade == 2 ? "T-2" : "T-3") : ""
+							if prospectiveText != ""
+								label textLbl = plainTimeLabel(prospectiveTime, prospectiveMarkerPrice(cfg, isIdx, c.price, true, prospectiveCurrent), prospectiveText, color.white, cfg.prospTextSize == "Large" ? size.large : cfg.prospTextSize == "Normal" ? size.normal : cfg.prospTextSize == "Small" ? size.small : size.tiny)
+								array.push(ghostLabels, textLbl)
+				clearLabelStore(newTLabels)
+				int chainSizeCurr = array.size(chain)
+				for depth = 1 to 2
+					if chainSizeCurr >= depth + 1
+						CycleNode ancestor = array.get(chain, chainSizeCurr - depth - 1)
+						if array.size(ancestor.candidates) > 0
+							clearAlternativeLabels(ancestor)
+							for ancestorCandidate in ancestor.candidates
+								if isConfirmedCanonicalCandidate(cfg, ancestorCandidate) and ancestorCandidate.constraintOk
+									renderConfirmedAlternative(cfg, ctx, isIdx, runtime, ancestor, ancestorCandidate)
+			int maxWaitBar = 0
+			if duration >= cfg.cycleMaxBars - cfg.currentCheckDelay and duration < cfg.cycleMaxBars + cfg.currentCheckDelay
+				for c in curr.candidates
+					if isLeftCanonicalCandidate(cfg, c) and c.swingState < 2
+						int candidateOffset = bar_index - c.barIdx
+						bool prospectiveAlive = historyOffsetOk(candidateOffset) and rightConditionAlive(isIdx, candidateOffset, c.price, cfg.currentCheckDelay)
+						if c.constraintOk and prospectiveAlive
+							int confirmationBar = c.barIdx + cfg.currentCheckDelay
+							if confirmationBar > bar_index and confirmationBar > maxWaitBar
+								maxWaitBar := confirmationBar
+			bool closureReason_PreLockInvalidation = preLockInvalidation
+			bool shouldCloseCycle = preLockInvalidation or (duration >= cfg.cycleMaxBars ? maxWaitBar <= bar_index : isWaitingDecision(curr))
+			if shouldCloseCycle
+				ContinuationPick bestPick = selectContinuationPick(cfg, ctx, isIdx, curr, 0, closureReason_PreLockInvalidation, na, na)
+				if not na(bestPick)
+					materializeContinuationPick(cfg, ctx, isIdx, runtime, bestPick, 2)
+					if closureReason_PreLockInvalidation
+						nxtAlert := false
+				else
+					int chainSize = array.size(chain)
+					// Oltre T-3 max + raccordo T-4 max non e' piu' accettabile
+					// sacrificare molti cicli gia' centrati per inseguire una soluzione
+					// canonica remota. Il ramo locale viene comunque valutato con fino a
+					// due raccordi separati da un T-3; il backtracking e' limitato al padre.
+					bool starvationGuardActive = duration >= cfg.cycleMaxBars + cfg.raccT4MaxBars
+					int btLevel = 0
+					ContinuationPick btPick = na
+					CycleNode btParent = na
+					PossibleRaccordo[] possibleRaccordiIndex = array.new<PossibleRaccordo>()
+					int raccordoFirstEnd = cycleCloseBarFromDuration(isIdx, curr.startBar, raccT6MinBars)
+					int raccordoLimit = math.min(bar_index, cycleCloseBarFromDuration(isIdx, curr.startBar, cfg.raccT4MaxBars))
+					if raccordoLimit >= raccordoFirstEnd
+						for raccordoBar = raccordoFirstEnd to raccordoLimit
+							int raccordoDuration = cycleDurationFrom(isIdx, curr.startBar, raccordoBar)
+							int raccordoOffset = bar_index - raccordoBar
+							if raccordoOffset < 0 or raccordoOffset > 5000
+								continue
+							float raccordoTarget = sidePivotAt(isIdx, raccordoOffset)
+							if na(raccordoTarget)
+								continue
+							bool raccordoLeft = checkSwingCondition(isIdx, true, raccordoOffset, raccordoTarget, 1)
+							if raccordoLeft
+								int raccordoAge = raccordoBar - startBar
+								int raccordoType = getRaccordoType(cfg, raccordoDuration, raccordoAge)
+								if raccordoType != RACC_INVALID
+									bool raccordoSpacing = isRaccordoSpacingValid(cfg, ctx, isIdx, raccordoType, raccordoBar)
+									bool raccordoRight = checkRightConditionForRaccordo(isIdx, raccordoBar, raccordoTarget, raccordoType)
+									if raccordoSpacing and raccordoRight
+										PossibleRaccordo raccordoPoint = PossibleRaccordo.new(curr.startBar, raccordoBar, raccordoTarget, raccordoType)
+										array.push(possibleRaccordiIndex, raccordoPoint)
+					int requestedBacktrackDepth = cfg.fullBacktrackOnFailure ? chainSize - 1 : cfg.maxBacktrackDepth
+					int effectiveBacktrackDepth = starvationGuardActive ? math.min(cfg.maxBacktrackDepth, requestedBacktrackDepth) : requestedBacktrackDepth
+					for level = 1 to effectiveBacktrackDepth
+						if chainSize < level + 1
+							break
+						CycleNode ancestor = array.get(chain, chainSize - level - 1)
+						if isRaccordo(ancestor) and ancestor.isRaccordoConfirmed
+							continue
+						CycleNode childNode = array.get(chain, chainSize - level)
+						bool failedChildResolutionExpired = cycleDurationFrom(isIdx, childNode.startBar, bar_index) > cfg.cycleMaxBars + cfg.raccT4MaxBars
+						// Un ? puo completare la DX dopo la chiusura del nodo antenato.
+						if historyOffsetOk(bar_index - ancestor.startBar)
+							refreshCandidatesPreservingAttempts(cfg, isIdx, ancestor)
+						for c in ancestor.candidates
+							if c.barIdx == childNode.startBar and failedChildResolutionExpired
+								c.attemptCount += 1
+								do_markAsTried(triedStarts, c.barIdx, ancestor.id, ancestor.isLocked)
+								break
+						ContinuationPick levelBestPick = selectContinuationPick(cfg, ctx, isIdx, ancestor, 2, false, childNode.startBar, possibleRaccordiIndex)
+						if not na(levelBestPick)
+							btPick := levelBestPick
+							btParent := ancestor
+							btLevel := level
+							break
+					bool failedAncestorApplied = false
+					if na(btPick) or na(btParent)
+						int failedChainSize = array.size(chain)
+						for failedLevel = 1 to 2
+							if failedAncestorApplied or failedLevel > effectiveBacktrackDepth or failedChainSize < failedLevel + 1
+								break
+							CycleNode failedChild = array.get(chain, failedChainSize - failedLevel)
+							if failedChild.raccType != RACC_NONE and failedChild.raccType != RACC_RESET
+								break
+							CycleNode failedParent = array.get(chain, failedChainSize - failedLevel - 1)
+							if failedParent.raccType == RACC_NONE and not na(runtime.startBar) and failedParent.startBar >= runtime.startBar
+								failedAncestorApplied := applyPrunedAncestorBridge(cfg, ctx, isIdx, runtime, failedLevel, na)
+								if failedAncestorApplied
+									CycleNode failedTail = array.last(chain)
+									failedTail.candidates := scanCandidates(cfg, isIdx, failedTail.startBar)
+					if not na(btPick) and not na(btParent)
+						trimChainTo(chain, array.size(chain) - btLevel)
+						btParent.isClosed := false
+						materializeContinuationPick(cfg, ctx, isIdx, runtime, btPick, 1)
+					else if not failedAncestorApplied
+						int resetTransparency = na
+						bool isCase1 = closureReason_PreLockInvalidation
+						if not isCase1 and curr.isLocked
+							isCase1 := true
+							for c in curr.candidates
+								if c.swingState == 2 and isCanonicalCandidate(cfg, c) and c.constraintOk
+									isCase1 := false
+									break
+						bool resolutionApplied = false
+						bool mergeRequested = false
+						int mergeEndBar = na
+						float mergeEndPrice = na
+						if isCase1
+							int case1EndBar = curr.lastValidBar
+							float case1EndPrice = curr.lastValidLevel
+							if not resolutionApplied and chainSize >= 2
+								CycleNode padre = array.get(chain, chainSize - 2)
+								if padre.raccType == RACC_NONE
+									refreshCandidatesPreservingAttempts(cfg, isIdx, padre)
+									for c in padre.candidates
+										if c.barIdx == curr.startBar
+											c.attemptCount += 1
+											break
+									ContinuationPick padrePick = selectContinuationPick(cfg, ctx, isIdx, padre, 1, false, na, na)
+									if not na(padrePick)
+										trimChainTo(chain, array.size(chain) - 1)
+										padre.isClosed := false
+										materializeContinuationPick(cfg, ctx, isIdx, runtime, padrePick, 0)
+										resolutionApplied := true
+							if not resolutionApplied
+								resolutionApplied := resolveLocalLockedRaccordo(cfg, ctx, isIdx, runtime, false)
+							if not resolutionApplied
+								PossibleRaccordo chosenCase1 = na
+								string chosenCase1Tag = ""
+								int case1Duration = cycleDurationFrom(isIdx, curr.startBar, case1EndBar)
+								int case1Type = getRaccordoType(cfg, case1Duration, case1EndBar - startBar)
+								int lastChanceScore = 999999
+								for case1Index = -1 to array.size(possibleRaccordiIndex) - 1
+									bool directCase1 = case1Index == -1
+									PossibleRaccordo pr = directCase1 ? na : array.get(possibleRaccordiIndex, case1Index)
+									int endpointBar = directCase1 ? case1EndBar : pr.endBar
+									float endpointPrice = directCase1 ? case1EndPrice : pr.endPrice
+									int endpointType = directCase1 ? case1Type : pr.raccType
+									bool originOk = directCase1 ? case1Type != RACC_INVALID and checkRightConditionForRaccordo(isIdx, curr.startBar, curr.startPrice, RACC_T5) : pr.startBar == curr.startBar
+									if originOk and canStartT3AfterRaccordo(cfg, isIdx, endpointBar, endpointPrice) and bridgeEndHasViableT3(cfg, isIdx, endpointBar, endpointPrice) and canConvertCurrentToRaccordo(cfg, ctx, chain, endpointType, endpointBar, isIdx)
+										if directCase1
+											chosenCase1 := PossibleRaccordo.new(curr.startBar, endpointBar, endpointPrice, endpointType)
+											break
+										int raccordoScore = cycleDurationFrom(isIdx, pr.startBar, endpointBar) * 10
+										if raccordoScore < lastChanceScore
+											lastChanceScore := raccordoScore
+											chosenCase1 := pr
+											chosenCase1Tag := "LAST CHANCE"
+								if not na(chosenCase1)
+									confirmBisnonnoRaccordi(chain)
+									resolutionApplied := applyCurrentNodeRaccordo(cfg, ctx, isIdx, chain, chosenCase1, false, chosenCase1Tag)
+							if not resolutionApplied
+								mergeRequested := true
+								mergeEndBar := case1EndBar
+								mergeEndPrice := case1EndPrice
+						else
+							ContinuationPick bridgePick = findBridgeRaccordo(cfg, ctx, isIdx, curr.startBar, curr.startPrice)
+							if not na(bridgePick)
+								resolutionApplied := appendBridgeRaccordoInternal(cfg, ctx, isIdx, chain, bridgePick, false)
+								if not resolutionApplied
+									mergeRequested := true
+									mergeEndBar := bridgePick.raccEndBar
+									mergeEndPrice := sidePivotOnBar(isIdx, bridgePick.raccEndBar)
+						if mergeRequested
+							int mergedType = RACC_INVALID
+							int mergeSize = array.size(chain)
+							if mergeSize >= 2
+								CycleNode previousRaccordo = array.get(chain, mergeSize - 2)
+								CycleNode mergeCurrent = array.get(chain, mergeSize - 1)
+								if isRaccordo(previousRaccordo) and not isRaccordo(mergeCurrent) and mergeEndBar > mergeCurrent.startBar
+									int mergedDuration = cycleDurationFrom(isIdx, previousRaccordo.startBar, mergeEndBar)
+									int mergeRootBar = runtime.startBar
+									int mergeAge = not na(mergeRootBar) ? mergeEndBar - mergeRootBar : mergeEndBar
+									int tryType = getRaccordoType(cfg, mergedDuration, mergeAge)
+									if tryType != RACC_INVALID and checkRightConditionForRaccordo(isIdx, previousRaccordo.startBar, previousRaccordo.startPrice, RACC_T5)
+										mergedType := tryType
+							bool mergeValid = mergedType != RACC_INVALID and raccordoPhaseAllowed(cfg, ctx, isIdx, mergedType, mergeEndBar) and canStartT3AfterRaccordo(cfg, isIdx, mergeEndBar, mergeEndPrice) and bridgeEndHasViableT3(cfg, isIdx, mergeEndBar, mergeEndPrice)
+							if mergeValid
+								int mergeEndTime = historyTimeAt(mergeEndBar)
+								int mergeNextId = array.last(chain).id
+								trimChainTo(chain, array.size(chain) - 1)
+								CycleNode raccordo = array.last(chain)
+								raccordo.isClosed := true
+								raccordo.raccType := mergedType
+								raccordo.lastValidBar := mergeEndBar
+								raccordo.lastValidLevel := mergeEndPrice
+								line.set_x2(raccordo.lnCycle, mergeEndTime)
+								label.set_text(raccordo.lblInfo, cfg.debugMode ? "R(" + raccText(mergedType) + ")\nMERGE" : "R(" + raccText(mergedType) + ")")
+								raccordo.paint(cfg, cfg.raccordoColor, cfg.labelColorRaccordo, 80)
+								confirmBisnonnoRaccordi(chain)
+								array.push(chain, buildDailyNode(cfg, mergeNextId, mergeEndBar, mergeEndPrice, isIdx, false))
+								array.clear(triedStarts)
+							resolutionApplied := mergeValid
+						if not resolutionApplied
+							if isCase1 and chainSize >= 2
+								CycleNode padreNode = array.get(chain, chainSize - 2)
+								for c in padreNode.candidates
+									if c.barIdx == curr.startBar
+										c.attemptCount := math.max(c.attemptCount, 3)
+										break
+							// Un restart confermato sul nodo corrente ha precedenza sulla recovery
+							// globale; la vecchia priorita poteva riportare la chain al vecchio T-3.
+							// La recovery globale puo' risalire diversi T-3. Dopo il limite
+							// anti-starvation deve invece vincere il restart locale confermato.
+							resetTransparency := isCase1 ? 35 : 45
+						if not na(resetTransparency)
+							Candidate restart = na
+							bool restartTimedOut = false
+							for restartPhase = 0 to 2
+								if restartPhase > 0 and (not na(restart) or not (duration >= cfg.cycleMaxBars + cfg.raccT4MaxBars))
+									break
+								if restartPhase == 1
+									for restartCandidate in curr.candidates
+										bool structurallyConfirmed = isConfirmedCanonicalCandidate(cfg, restartCandidate) and restartCandidate.barIdx > curr.startBar and restartCandidate.constraintOk
+										int restartOffset = bar_index - restartCandidate.barIdx
+										if structurallyConfirmed and scanOffsetOk(restartOffset) and (na(restart) or candidateTieBetter(cfg, ctx, isIdx, curr.startBar, restartCandidate, restart, true))
+											restart := restartCandidate
+								else
+									bool restartProspective = restartPhase == 2
+									Candidate restartBest = na
+									int restartRight = cfg.currentCheckDelay
+									int restartScan = restartProspective ? math.max(curr.startBar + 1, bar_index - restartRight) : math.max(curr.startBar + 1, 0)
+									if restartScan <= bar_index
+										for restartBar = restartScan to bar_index
+											int restartCandidateOffset = bar_index - restartBar
+											if scanOffsetOk(restartCandidateOffset)
+												float restartTarget = sidePivotAt(isIdx, restartCandidateOffset)
+												int restartDuration = cycleDurationFrom(isIdx, curr.startBar, restartBar)
+												bool restartColorOk = isIdx ? close[restartCandidateOffset] < open[restartCandidateOffset] : close[restartCandidateOffset] >= open[restartCandidateOffset]
+												bool restartDurationOk = restartDuration >= cfg.cycleMinBars or (cfg.allow23Exception and restartDuration == 23 and restartColorOk)
+												bool restartOk = restartDurationOk and not na(restartTarget) and candidateSatisfiesConstraintAtClose(cfg, isIdx, curr.startBar, curr.startPrice, restartBar, restartTarget)
+												if restartProspective
+													bool restartLeftOk = restartOk and checkSwingCondition(isIdx, true, restartCandidateOffset, restartTarget, 3)
+													bool restartRightConfirmed = restartLeftOk and checkSwingCondition(isIdx, false, restartCandidateOffset, restartTarget, restartRight)
+													restartOk := restartLeftOk and not restartRightConfirmed and rightConditionAlive(isIdx, restartCandidateOffset, restartTarget, restartRight)
+												else
+													restartOk := restartOk and canStartT3AfterRaccordo(cfg, isIdx, restartBar, restartTarget)
+												if restartOk
+													Candidate restartProposal = makeCandidate(restartBar, restartTarget, restartDuration, true, not restartProspective)
+													if na(restartBest) or candidateTieBetter(cfg, ctx, isIdx, curr.startBar, restartProposal, restartBest, not restartProspective)
+														restartBest := restartProposal
+									restart := restartBest
+								if restartPhase > 0
+									restartTimedOut := not na(restart)
+							bool restartFound = not na(restart)
+							curr.isClosed := restartFound
+							curr.raccType := RACC_RESET
+							bool recovered = false
+							if not restartFound and not starvationGuardActive
+								bool stressApplied = false
+								bool stressUsedDx5 = false
+								int stressParentPos = na
+								ContinuationPick stressPick = na
+								int firstResetBar = na
+								int maxDailyId = na
+								int resetsSeen = 0
+								int stressChainSize = array.size(chain)
+								if stressChainSize > 0
+									for stressIndex = stressChainSize - 1 to 0
+										CycleNode stressNode = array.get(chain, stressIndex)
+										if na(maxDailyId) and not isRaccordo(stressNode)
+											maxDailyId := stressNode.id
+										int minWindowId = na(maxDailyId) ? 0 : math.max(0, maxDailyId - newTConfirmCycles + 1)
+										if stressNode.raccType == RACC_RESET and stressNode.id >= minWindowId
+											resetsSeen += 1
+											if resetsSeen == 2
+												firstResetBar := stressNode.startBar
+												break
+								if not na(firstResetBar)
+									for stressIndex = 0 to stressChainSize - 1
+										CycleNode stressNode = array.get(chain, stressIndex)
+										if isVisibleDailyNode(stressNode) and stressNode.startBar < firstResetBar
+											stressParentPos := stressIndex
+									if not na(stressParentPos)
+										CycleNode recoveryParent = array.get(chain, stressParentPos)
+										for recoveryStage = 0 to 1
+											int recoveryRightOverride = recoveryStage == 0 ? 0 : 5
+											bool recoveryPending = false
+											ContinuationPick stagePick = na
+											Candidate[] recoveryCandidates = scanCandidatesWithRight(cfg, isIdx, recoveryParent.startBar, recoveryRightOverride)
+											int recoveryRight = recoveryRightOverride > 0 ? recoveryRightOverride : cfg.currentCheckDelay
+											for recoveryCandidate in recoveryCandidates
+												bool noLaterInvalidation = isCanonicalCandidate(cfg, recoveryCandidate) and recoveryCandidate.constraintOk and not wouldHavePreLockInvalidation(cfg, isIdx, recoveryCandidate.barIdx, recoveryCandidate.price, bar_index)
+												if recoveryCandidate.swingState == 1 and noLaterInvalidation
+													int recoveryOffset = bar_index - recoveryCandidate.barIdx
+													if historyOffsetOk(recoveryOffset) and bar_index < recoveryCandidate.barIdx + recoveryRight and rightConditionAlive(isIdx, recoveryOffset, recoveryCandidate.price, recoveryRight)
+														recoveryPending := true
+												if recoveryCandidate.sequenceValid and recoveryCandidate.swingState == 2 and noLaterInvalidation
+													ContinuationPick recoveryCandidatePick = candidateContinuationPick(cfg, ctx, isIdx, recoveryCandidate)
+													int recoveryScore = recoveryCandidatePick.score
+													if recoveryScore > 0 and (na(stagePick) or recoveryScore > stagePick.score or (recoveryScore == stagePick.score and candidateTieBetter(cfg, ctx, isIdx, recoveryParent.startBar, recoveryCandidate, stagePick.candidate, true)))
+														stagePick := recoveryCandidatePick
+											if not na(stagePick)
+												stressUsedDx5 := recoveryStage == 1
+												stressPick := stagePick
+												break
+											if recoveryStage == 0 and recoveryPending
+												break
+								if not na(stressParentPos) and not na(stressPick)
+									CycleNode stressParent = array.get(chain, stressParentPos)
+									Candidate recoveryCandidate = stressPick.candidate
+									bool immediateMode = stressPick.mode == 2
+									bool topologyApplicable = not immediateMode or (not isRaccordo(stressParent) and stressPick.raccType != RACC_NONE and not na(stressPick.raccEndBar) and isRaccordoSpacingValid(cfg, ctx, isIdx, stressPick.raccType, stressPick.raccEndBar))
+									if topologyApplicable
+										trimChainTo(chain, stressParentPos + 1)
+										if immediateMode
+											stressApplied := appendBridgeRaccordoInternal(cfg, ctx, isIdx, chain, stressPick, true)
+											if stressApplied and stressUsedDx5
+												markDx5RecoveryNode(cfg, array.last(chain), isIdx)
+										else
+											stressParent.isClosed := true
+											int recoveryTime = historyTimeAt(recoveryCandidate.barIdx)
+											line.set_x2(stressParent.lnCycle, recoveryTime)
+											label.set_text(stressParent.lblInfo, fmtLbl(isIdx, stressParent.id, false))
+											int recoveryNextId = stressParent.id + 1
+											CycleNode recoveryNode = buildDailyNode(cfg, recoveryNextId, recoveryCandidate.barIdx, recoveryCandidate.price, isIdx, true)
+											if stressUsedDx5
+												markDx5RecoveryNode(cfg, recoveryNode, isIdx)
+											array.push(chain, recoveryNode)
+											array.clear(triedStarts)
+											stressApplied := true
+								recovered := stressApplied
+							if not recovered
+								bool pendingT3Bridge = curr.id == 11 and weeklyOrdinalFrom(chain, startBar, curr.startBar) == 11
+								string restartLabel = pendingT3Bridge and not restartFound ? "R(T-3)?\nAttesa New T" : fmtReset(isIdx, curr.id) + (restartFound ? "" : "\nAttesa")
+								label.set_text(curr.lblInfo, cfg.debugMode and restartTimedOut ? restartLabel + "\nTIMEOUT" : restartLabel)
+								curr.paint(cfg, specialResetColor, dailyTextColor(cfg, isIdx, curr.isLocked), resetTransparency)
+								label.set_size(curr.lblInfo, cfg.debugMode ? size.huge : size.large)
+								if restartFound
+									int restartTime = historyTimeAt(restart.barIdx)
+									line.set_x2(curr.lnCycle, restartTime)
+									array.push(chain, buildDailyNode(cfg, curr.id + 1, restart.barIdx, restart.price, isIdx, true))
+									array.clear(triedStarts)
+	runtime.preLockAlert := nxtAlert
+	true
+// ==============================================================================
+// 14. RENDERING FINALE
+// ==============================================================================
+// EG: gerarchia diagnostica opzionale. Specifica: ANALISI-EVOLUTA-SPEC.md.
+// Gli ordinali weekly descrivono la lettura scelta, non sommano origini concorrenti.
+higherWeeklyOrder(EngineConfig cfg, bool isIndex, CycleNode[] view, int contextBar) =>
+	int order = 1
+	int origin = na
+	for node in view
+		if node.weeklyOrder > 0 and node.startBar <= contextBar
+			order := node.weeklyOrder
+			origin := node.startBar
+	if not na(origin) and weeklyWindowFrom(cfg, isIndex, origin, weeklyOrdinalFrom(view, origin, contextBar), contextBar)
+		order += 1
+	order
+
+// Solo T-3 canonici chiusi: raccordi/reset/recovery non sono giornalieri compiuti.
+higherDailyState(EngineConfig cfg, bool isIndex, CycleNode[] view, int origin, int throughBar, bool virtualEndpoint = false) =>
+	int completed = 0
+	int sixthClose = na
+	bool joined = false
+	if array.size(view) > 0
+		for i = 0 to array.size(view) - 1
+			CycleNode node = array.get(view, i)
+			if not joined and node.startBar >= origin
+				if node.startBar > origin and node.startBar <= throughBar
+					// Origine virtuale: contare il primo tratto solo se si ricongiunge canonicamente.
+					bool connected = evolvedPrePivotReady(cfg, isIndex, origin) and evolvedPrePivotReady(cfg, isIndex, node.startBar) and evolvedDailySpanOk(cfg, isIndex, origin, node.startBar)
+					completed := connected ? 1 : int(na)
+				joined := true
+			bool tail = i == array.size(view) - 1
+			int endpoint = tail ? throughBar : array.get(view, i + 1).startBar
+			bool closed = tail ? virtualEndpoint and evolvedPrePivotReady(cfg, isIndex, endpoint) and evolvedDailySpanOk(cfg, isIndex, node.startBar, endpoint) : node.isClosed
+			if node.startBar >= origin and node.startBar < endpoint and endpoint <= throughBar and closed and node.raccType == RACC_NONE
+				completed += 1
+				if completed == 6
+					sixthClose := endpoint
+	[completed, sixthClose]
+
+higherMonthlyLock(EngineConfig cfg, bool isIndex, CycleNode[] view, int origin, int throughBar) =>
+	[_, sixthClose] = higherDailyState(cfg, isIndex, view, origin, throughBar)
+	na(sixthClose) ? na : firstExtremeBar(isIndex, sidePivotOnBar(isIndex, origin), sixthClose, throughBar)
+
+higherTitle(bool isIndex, int order, int kind) =>
+	string week = str.tostring(order) + "'" + (isIndex ? "T" : "Ti")
+	kind > 0 ? "T+" + str.tostring(kind - 1) + (isIndex ? "" : "i") + " (" + week + ")" : week
+
+higherSetTitle(label lbl, string title) =>
+	string old = label.get_text(lbl)
+	string flags = (str.contains(old, "⚡⚡") ? " ⚡⚡" : str.contains(old, "⚡") ? " ⚡" : "") + (str.contains(old, "🌩️") ? " 🌩️" : "") + (str.contains(old, "⚠️") ? " ⚠️" : "")
+	if str.contains(old, "Probabilmente")
+		flags += " - Probabilmente\nnon inizia da qua"
+	int slash = str.pos(old, " / ")
+	string reading = not str.startswith(title, "T+") and str.startswith(old, "New ") ? (str.contains(str.substring(old, 0, na(slash) ? str.length(old) : slash), "?") ? "?" : "") + (not na(slash) ? str.substring(old, slash) : flags) : flags
+	label.set_text(lbl, title + reading)
+	true
+
+renderHigherAnalysis(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, CycleNode[] view, map<int, int> points, map<int, int> contexts, int latestWeekly) =>
+	if array.size(view) > 0
+		int manualOrigin = array.first(view).startBar
+		CycleNode[] contextView = evolvedPrePivotContext(cfg, isIndex, manualOrigin)
+		array.concat(contextView, view)
+		if cfg.showEvolvedSwings and na(latestWeekly)
+			drawEvolvedT3SwingLine(cfg, ctx, isIndex, manualOrigin, false, state.swingLines, state.newTLabels)
+			drawEvolvedSwingLine(cfg, ctx, isIndex, findEvolvedTerminalStart(cfg, isIndex, contextView, manualOrigin, 1, manualOrigin), manualOrigin, evolvedWeeklyMinDuration(cfg), 1, false, state.swingLines, state.newTLabels)
+		map<int, string> titles = map.new<int, string>()
+		int previousWeek = manualOrigin
+		for node in view
+			if node.weeklyOrder > 0
+				if node.startBar > manualOrigin and not map.contains(contexts, node.startBar)
+					map.put(contexts, node.startBar, previousWeek)
+				map.put(titles, node.startBar, higherTitle(isIndex, node.weeklyOrder, 0))
+				previousWeek := node.startBar
+		map.put(contexts, manualOrigin, array.size(contextView) > array.size(view) ? array.first(contextView).startBar : manualOrigin)
+		int[] bars = map.keys(contexts)
+		array.sort(bars)
+		for kind = 2 to 3
+			int origin = manualOrigin
+			int drawnBar = origin
+			int drawnLower = findEvolvedTerminalStart(cfg, isIndex, contextView, origin, kind, map.get(contexts, origin))
+			[_, _, initialBreak] = evolvedSwing(isIndex, drawnLower, origin, bar_index - origin + 1)
+			int proofBar = origin
+			int monthlyLock = na
+			for replay = 0 to array.size(bars)
+				int winner = na
+				int winnerLower = na
+				int winnerBreak = na
+				int latest = origin
+				int latestLower = drawnLower
+				for b in bars
+					if b <= origin or bar_index - b > 4999
+						continue
+					CycleNode[] branch = weeklyPointView(contextView, map.get(points, b))
+					[completed, _] = higherDailyState(cfg, isIndex, branch, origin, b, not na(map.get(points, b)))
+					if completed >= (kind == 2 ? 13 : 24) and completed <= (kind == 2 ? 21 : 43)
+						int lowerStart = findEvolvedTerminalStart(cfg, isIndex, branch, b, kind, map.get(contexts, b))
+						[_, _, broken] = evolvedSwing(isIndex, lowerStart, b, bar_index - b + 1)
+						int brokenBar = na(broken) ? na : b + broken
+						if not na(lowerStart) and na(brokenBar) and b > latest
+							latest := b
+							latestLower := lowerStart
+						if not na(brokenBar) and brokenBar >= proofBar and (na(winnerBreak) or brokenBar < winnerBreak)
+							winner := b
+							winnerLower := lowerStart
+							winnerBreak := brokenBar
+				if origin == manualOrigin and not na(initialBreak) and manualOrigin + initialBreak <= nz(winner, bar_index)
+					map.put(titles, origin, higherTitle(isIndex, 1, kind))
+				monthlyLock := kind == 3 ? higherMonthlyLock(cfg, isIndex, view, origin, nz(winner, bar_index)) : na
+				if not na(monthlyLock)
+					string oldTitle = map.get(titles, origin)
+					map.put(titles, origin, (na(oldTitle) ? higherTitle(isIndex, higherWeeklyOrder(cfg, isIndex, view, origin), 0) : oldTitle) + " 🌋")
+				if not na(winner)
+					origin := winner
+					proofBar := winnerBreak
+					map.put(titles, origin, higherTitle(isIndex, higherWeeklyOrder(cfg, isIndex, view, map.get(contexts, origin)) + 1, kind))
+					drawnLower := winnerLower
+				else
+					drawnBar := latest
+					drawnLower := latestLower
+					break
+			bool monthlyLocked = not na(monthlyLock)
+			if cfg.showEvolvedSwings
+				drawEvolvedSwingLine(cfg, ctx, isIndex, drawnLower, drawnBar, bar_index - drawnBar + 1, kind, drawnBar != origin, state.swingLines, state.newTLabels)
+			if monthlyLocked
+				for b in bars
+					if b > origin and b >= monthlyLock
+						CycleNode[] branch = weeklyPointView(contextView, map.get(points, b))
+						int jLower = findEvolvedTerminalStart(cfg, isIndex, branch, b, 1, map.get(contexts, b))
+						if not na(jLower)
+							[jLevel, jBar, _] = evolvedSwing(isIndex, jLower, b, 0)
+							if not na(jLevel) and not na(jBar)
+								float jGap = math.max(syminfo.mintick, math.abs(jLevel) * 0.00003)
+								array.push(state.newTLabels, label.new(jBar, jLevel + (isIndex ? jGap : -jGap), "Mini punto J", xloc=xloc.bar_index, color=color.yellow, textcolor=color.yellow, style=isIndex ? label.style_arrowdown : label.style_arrowup, size=size.small, force_overlay=true))
+							break
+		for node in view
+			if map.contains(titles, node.startBar)
+				higherSetTitle(node.lblInfo, map.get(titles, node.startBar))
+		for lbl in state.newTLabels
+			if str.startswith(label.get_text(lbl), "New ")
+				for [b, txt] in titles
+					if label.get_x(lbl) == historyTimeAt(b)
+						higherSetTitle(lbl, txt)
+	true
+
+export renderNewTLabelsFor(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, bool drawSwings, bool weeklyInvalidated) =>
+	CycleNode[] chain = state.chain
+	if array.size(chain) > 0
+		int origin = state.startBar
+		bool rolled = not na(state.previousWeeklyStart)
+		bool weeklyAlive = cfg.weeklyConstraintEnabled and state.weeklyLocked and not weeklyInvalidated
+		CycleNode root = weeklyRootNode(ctx, isIndex, chain)
+		int baseId = na(root) ? 0 : root.id
+		bool baseProbablyWrong = false
+		for node in chain
+			if node.raccType == RACC_RESET and node.id >= baseId and node.id <= baseId + 2
+				baseProbablyWrong := true
+				break
+		CycleNode[] view = weeklyContextView(ctx, isIndex, chain)
+		for node in view
+			if isVisibleDailyNode(node) and not isWaitingDecision(node)
+				bool isBase = node.startBar == origin
+				bool historic = node.startBar < origin
+				int localId = weeklyOrdinalFrom(view, historic ? state.weeklyContextStart : origin, node.startBar)
+				string txt = isBase ? (rolled ? (isIndex ? "New T" : "New Ti") : (isIndex ? "T" : "Ti")) : fmtLbl(isIndex, localId, node.hasAlternatives)
+				if node.startBar == state.weeklyContextStart and historic
+					txt := isIndex ? "T" : "Ti"
+				bool emergency = node.raccType == RACC_RECOVERY
+				if isBase and baseProbablyWrong
+					txt += " - Probabilmente\nnon inizia da qua"
+				if isBase and state.weeklyWarning
+					txt += " ⚠️"
+				txt := emergency ? addDoubleLockBolt(txt) : node.isLocked ? txt + " ⚡" : txt
+				bool storm = not historic and weeklyAlive and (isBase or not na(state.lockCandidateBar) and node.startBar >= state.lockCandidateBar)
+				label.set_text(node.lblInfo, txt + (storm ? " 🌩️" : ""))
+				bool newTBase = not historic and isBase and rolled
+				color c = emergency ? (isIndex ? emergencyRecoveryIndexColor : emergencyRecoveryInverseColor) : newTBase ? newTColor : isIndex ? (node.isLocked ? cfg.lineColorIndexLocked : cfg.lineColorIndex) : (node.isLocked ? cfg.lineColorInverseLocked : cfg.lineColorInverse)
+				node.paint(cfg, c, newTBase ? newTSoftColor : dailyTextColor(cfg, isIndex, node.isLocked or emergency), newTBase ? 60 : 78)
+				if not historic and isBase and baseProbablyWrong
+					label.set_textcolor(node.lblInfo, specialResetColor)
+		if drawSwings and barstate.islast
+			clearLabelStore(state.newTLabels)
+			int comparisonContext = nz(state.weeklyContextStart, state.startBar)
+			bool comparisonOpen = state.weeklyWarning or weeklyOrdinalFrom(view, comparisonContext, bar_index) <= 10
+			int viable = 0
+			map<int, int> points = weeklyCandidatePoints(cfg, ctx, isIndex, view)
+			map<int, int> higherContexts = map.new<int, int>()
+			CycleNode[] fullView = cfg.showHigherAnalysis ? weeklyContextView(ctx, isIndex, chain, true) : view
+			int latestBar = na
+			CycleNode[] latestBranch = na
+			int latestContext = na
+			bool latestProspective = false
+			if map.size(points) > 0
+				// Prima qualificazione completa, poi presentazione nello stesso ordine.
+				for pass = 0 to 1
+					for [candidateBar, parent] in points
+						float price = sidePivotOnBar(isIndex, candidateBar)
+						CycleNode[] branch = weeklyPointView(view, parent)
+						[eligible, dx, rank, ordinal, contextStart, _] = weeklyReadingState(cfg, ctx, isIndex, branch, candidateBar, price)
+						if pass == 0
+							if cfg.showHigherAnalysis and eligible
+								map.put(higherContexts, candidateBar, contextStart)
+							if eligible and contextStart == comparisonContext
+								viable += 1
+							if eligible and (na(latestBar) or candidateBar > latestBar)
+								latestBar := candidateBar
+								latestBranch := branch
+								latestContext := contextStart
+								latestProspective := not dx
+						else if eligible
+							bool swingBroken = rank > 0
+							bool confirmed = dx and swingBroken
+							bool keepOldReading = not confirmed
+							if keepOldReading
+								int visibleCount = 0
+								bool raccordiCompatible = true
+								for weeklyNode in branch
+									if isVisibleDailyNode(weeklyNode) and weeklyNode.startBar >= contextStart and weeklyNode.startBar < candidateBar
+										visibleCount += 1
+									if raccordiCompatible and isRaccordo(weeklyNode) and weeklyNode.startBar >= contextStart and weeklyNode.startBar < candidateBar
+										int endBar = na(weeklyNode.lastValidBar) ? candidateBar : weeklyNode.lastValidBar
+										raccordiCompatible := getRaccordoType(cfg, cycleDurationFrom(isIndex, weeklyNode.startBar, endBar), endBar - contextStart) == weeklyNode.raccType and raccordoPhaseAllowed(cfg, ctx, isIndex, weeklyNode.raccType, endBar)
+								keepOldReading := visibleCount < newTConfirmCycles and raccordiCompatible
+							string weeklyName = cfg.showHigherAnalysis ? "New " + str.tostring(higherWeeklyOrder(cfg, isIndex, fullView, contextStart) + 1) + "'" + (isIndex ? "T" : "Ti") : (isIndex ? "New T" : "New Ti")
+							string txt = weeklyName + (dx ? "" : "?") + (keepOldReading ? " / " + fmtLbl(isIndex, ordinal, false) : "")
+							bool older = candidateBar < latestBar
+							int lowerStart = cfg.debugMode or older and comparisonOpen and cfg.showEvolvedSwings ? findEvolvedTerminalStart(cfg, isIndex, branch, candidateBar, 1, origin) : na
+							if cfg.debugMode
+								txt += evolvedDebugSuffix(isIndex, lowerStart, candidateBar, cfg.showHigherAnalysis ? math.max(evolvedWeeklyMinDuration(cfg), bar_index - candidateBar + 1) : evolvedWeeklyMinDuration(cfg), "T-3")
+							// L'ordinale appartiene alla finestra originaria, non agli ID rinumerati.
+							if older and confirmed
+								txt += " / " + fmtLbl(isIndex, ordinal, false)
+							if older and comparisonOpen and cfg.showEvolvedSwings
+								txt += " · swing " + (swingBroken ? "☑️" : na(lowerStart) ? "—" : "X")
+							if candidateBar == origin and state.weeklyWarning
+								txt += " ⚠️"
+							if candidateBar == origin and baseProbablyWrong
+								txt += " - Probabilmente\nnon inizia da qua"
+							if na(parent)
+								for node in view
+									if node.startBar == candidateBar
+										label.set_text(node.lblInfo, txt + (node.isLocked ? " ⚡" : "") + (candidateBar >= origin and weeklyAlive ? " 🌩️" : ""))
+										node.paint(cfg, confirmed ? newTColor : (isIndex ? cfg.lineColorIndex : cfg.lineColorInverse), newTSoftColor, 60)
+										if candidateBar == origin and baseProbablyWrong
+											label.set_textcolor(node.lblInfo, specialResetColor)
+										break
+							else if cfg.showGhosts
+								color markerColor = confirmed ? newTColor : newTSoftColor
+								label lbl = pivotTimeLabel(isIndex, historyTimeAt(candidateBar), price, txt, color.new(markerColor, confirmed ? 45 : 75), markerColor, confirmed ? size.large : size.normal)
+								array.push(state.newTLabels, lbl)
+					if pass == 0
+						comparisonOpen := comparisonOpen or viable > 1
+			if cfg.showEvolvedSwings and not na(latestBar)
+				drawEvolvedT3SwingLine(cfg, ctx, isIndex, latestBar, latestProspective, state.swingLines, state.newTLabels)
+				int weeklySwingDeadline = evolvedWeeklyMinDuration(cfg)
+				for swingKind = 1 to (cfg.showHigherAnalysis ? 1 : 3)
+					int lowerStart = findEvolvedTerminalStart(cfg, isIndex, latestBranch, latestBar, swingKind, latestContext)
+					drawEvolvedSwingLine(cfg, ctx, isIndex, lowerStart, latestBar, weeklySwingDeadline, swingKind, latestProspective, state.swingLines, state.newTLabels)
+					weeklySwingDeadline *= 2
+			if cfg.showHigherAnalysis
+				renderHigherAnalysis(cfg, ctx, isIndex, state, fullView, points, higherContexts, latestBar)
+	true
+
+export diagnosticTableBetter(ConstraintScenario challenger, ConstraintScenario incumbent) =>
+	na(incumbent) or challenger.score > incumbent.score or (challenger.score == incumbent.score and challenger.rank > incumbent.rank)
+
+
+
+// Ripulisce esplicitamente ogni oggetto creato dal motore intraday. Le
+// variabili scalari vengono azzerate nel ramo top-level del timeframe errato.
+// Unico passo per live e replay. Finche' DX non matura il candidato e' un
+// record estremo: nessuna wick intermedia puo' superarlo senza sostituirlo.
+export weeklyConstraintStep(EngineConfig cfg, bool isIndex, SideRuntime state, int atBar, float value, float rootPrice) =>
+	if not state.weeklyLocked
+		if isMoreExtreme(isIndex, value, rootPrice)
+			if na(state.firstLockBar)
+				state.firstLockBar := atBar
+			if na(state.lockCandidateBar) or isMoreExtreme(isIndex, value, sidePivotOnBar(isIndex, state.lockCandidateBar))
+				state.lockCandidateBar := atBar
+		if not na(state.lockCandidateBar) and atBar - state.lockCandidateBar >= cfg.newTRightBars
+			state.weeklyLocked := true
+	true
+
+// Quando una New T storica viene confermata, ricostruisce il vincolo dalla sua
+// vera origine invece di iniziarlo artificialmente sulla barra corrente.
+
+// Recovery weekly indipendente dalla chain guasta. Riusa le stesse prove della
+// New T: pivot SX/DX, invalidazione propria e swing T terminale ricostruito.
+weeklyRestartRank(EngineConfig cfg, EngineContext ctx, bool isIndex, CycleNode[] view, int contextStart, int candidateBar) =>
+	int rank = 0
+	int offset = bar_index - candidateBar
+	float price = historyOffsetOk(offset) ? sidePivotAt(isIndex, offset) : na
+	[_, dx] = weeklyRightState(cfg, isIndex, candidateBar, price)
+	if dx and wLeft(cfg, isIndex, candidateBar, price) and weeklySequenceFrom(cfg, isIndex, view, contextStart, candidateBar, price)
+		int lockBar = weeklyCandidateLockBar(isIndex, candidateBar, price)
+		if not preLockInvalidatedUntil(isIndex, candidateBar, lockBar, bar_index)
+			CycleNode[] context = evolvedPrePivotContext(cfg, isIndex, candidateBar)
+			rank := evolvedWeeklyRank(cfg, ctx, isIndex, context, candidateBar)
+	rank
+
+// Policy 1: il dodicesimo segmento, unico R(T-3) fra due T.
+// Policy 2: dopo il fallimento daily, barra maturata o backfill all'ingresso
+// in Attesa. L'ordine di scansione e il tie-break restano propri di ciascuna.
+export weeklyFallbackPoint(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, bool bridge) =>
+	int bestBar = na
+	int bestRank = 0
+	CycleNode[] chain = state.chain
+	if array.size(chain) > 0 and (bridge or isWaitingDecision(array.last(chain)))
+		CycleNode[] view = weeklyContextView(ctx, isIndex, chain)
+		CycleNode tail = array.last(chain)
+		Candidate[] bridgeCandidates = na
+		int firstBar = na
+		int count = 0
+		if bridge
+			int ordinal = weeklyOrdinalFrom(chain, state.startBar, tail.startBar)
+			if ordinal == 11 and (tail.raccType == RACC_NONE or tail.raccType == RACC_RESET)
+				bridgeCandidates := scanCandidates(cfg, isIndex, tail.startBar)
+				count := array.size(bridgeCandidates)
+		else
+			string key = "WR_" + str.tostring(tail.startBar)
+			bool backfill = not array.includes(state.triedStarts, key)
+			int lastBar = bar_index - cfg.newTRightBars
+			firstBar := backfill ? math.max(tail.startBar + 1, math.max(0, lastBar - (newTConfirmCycles + 1) * (cfg.cycleMaxBars + 1))) : lastBar
+			if backfill
+				array.push(state.triedStarts, key)
+			count := firstBar <= lastBar ? lastBar - firstBar + 1 : 0
+		if count > 0
+			for i = 0 to count - 1
+				Candidate c = bridge ? array.get(bridgeCandidates, i) : na
+				int b = bridge ? c.barIdx : firstBar + i
+				bool segmentOk = not bridge or diagnosticCandidateOk(cfg, c) and not wouldHavePreLockInvalidation(cfg, isIndex, tail.startBar, tail.startPrice, b, true)
+				int rank = segmentOk ? weeklyRestartRank(cfg, ctx, isIndex, view, state.startBar, b) : 0
+				if betterWeeklyRestart(isIndex, b, rank, bestBar, bestRank)
+					bestBar := b
+					bestRank := rank
+	bestBar
+
+// Materializza una candidata virtuale, il ponte R(T-3), oppure una recovery
+// weekly pura. Il commit e' unico: potatura, archivio, root e replay vincolo.
+export commitWeeklyFallback(EngineConfig cfg, EngineContext ctx, bool isIndex, SideRuntime state, int newStart, int parentBar, int contextStart, bool keepContext, int policy) =>
+	bool applied = false
+	CycleNode[] chain = state.chain
+	CycleNode[] history = state.weeklyHistory
+	if not na(newStart) and newStart != state.startBar and array.size(chain) > 0
+		int oldStart = state.startBar
+		CycleNode[] orderView = cfg.showHigherAnalysis ? weeklyContextView(ctx, isIndex, chain, true) : na
+		int nextOrder = cfg.showHigherAnalysis ? higherWeeklyOrder(cfg, isIndex, orderView, nz(contextStart, oldStart)) + 1 : 0
+		renderNewTLabelsFor(cfg, ctx, isIndex, state, false, cfg.weeklyConstraintEnabled and state.weeklyLocked and oldWeeklyConstraintInvalidated(cfg, ctx, isIndex, state))
+		refreshCycleGeometry(cfg, isIndex, chain)
+		if policy == RACC_RECOVERY
+			CycleNode tail = array.last(chain)
+			if tail.raccType == RACC_RESET
+				label.set_text(tail.lblInfo, fmtReset(isIndex, tail.id))
+			tail.isClosed := true
+			line.set_x2(tail.lnCycle, historyTimeAt(newStart))
+			array.push(chain, buildDailyNode(cfg, 0, newStart, sidePivotOnBar(isIndex, newStart), isIndex, false))
+			applied := true
+		else
+			bool materialized = na(parentBar)
+			int targetBar = materialized ? newStart : parentBar
+			int nodePos = na
+			for sourceId = 0 to 1
+				if sourceId == 1 and not na(nodePos)
+					break
+				CycleNode[] sourceNodes = sourceId == 0 ? chain : history
+				if array.size(sourceNodes) > 0
+					for i = 0 to array.size(sourceNodes) - 1
+						CycleNode node = array.get(sourceNodes, i)
+						if (not materialized or isVisibleDailyNode(node)) and node.startBar == targetBar
+							if sourceId == 0
+								nodePos := i
+							else
+								while array.size(history) > i
+									array.unshift(chain, array.pop(history))
+								nodePos := 0
+							break
+			if materialized
+				applied := not na(nodePos)
+			else if not na(nodePos)
+				CycleNode parent = array.get(chain, nodePos)
+				for c in scanCandidates(cfg, isIndex, parent.startBar)
+					if c.barIdx == newStart and diagnosticCandidateOk(cfg, c)
+						trimChainTo(chain, nodePos + 1)
+						closeDailyAtCandidate(cfg, isIndex, parent, c, true)
+						if policy == RACC_T3
+							parent.raccType := RACC_T3
+							parent.isRaccordoConfirmed := true
+							label.set_text(parent.lblInfo, "R(T-3)")
+							parent.paint(cfg, cfg.raccordoColor, cfg.labelColorRaccordo, 80)
+						array.push(chain, buildDailyNode(cfg, 0, newStart, c.price, isIndex, false))
+						applied := true
+						break
+		if applied
+			while array.size(chain) > 1 and array.first(chain).startBar < newStart
+				array.push(history, array.shift(chain))
+			int nextId = 0
+			for node in chain
+				if not isRaccordo(node)
+					node.id := nextId
+					string nodeTitle = node.raccType == RACC_RECOVERY ? addDoubleLockBolt(fmtLbl(isIndex, nextId, false)) : node.raccType == RACC_RESET ? fmtReset(isIndex, nextId) : fmtLbl(isIndex, nextId, node.hasAlternatives)
+					label.set_text(node.lblInfo, nodeTitle)
+					nextId += 1
+				if isVisibleDailyNode(node)
+					node.candidates := scanCandidates(cfg, isIndex, node.startBar)
+			CycleNode root = array.first(chain)
+			if cfg.showHigherAnalysis
+				for node in orderView
+					if node.weeklyOrder >= nextOrder
+						node.weeklyOrder := 0
+				root.weeklyOrder := nextOrder
+			label.set_text(root.lblInfo, isIndex ? "New T" : "New Ti")
+			array.clear(state.triedStarts)
+			state.previousWeeklyStart := nz(contextStart, oldStart)
+			state.weeklyContextStart := policy != RACC_NONE ? newStart : keepContext ? state.weeklyContextStart : nz(contextStart, oldStart)
+			state.startBar := newStart
+			state.weeklyLocked := false
+			state.firstLockBar := na
+			state.lockCandidateBar := na
+			for b = math.max(newStart, bar_index - 4999) to bar_index
+				weeklyConstraintStep(cfg, isIndex, state, b, sidePivotOnBar(isIndex, b), root.startPrice)
+	applied

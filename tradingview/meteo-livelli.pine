@@ -1,0 +1,397 @@
+//@version=6
+// ==============================================================================
+// METEO LIVELLI
+// ==============================================================================
+// Disegna i livelli calcolati dalla dashboard "Meteo del Mercato".
+// Pine non puo' fare richieste HTTP: i livelli arrivano nell'input testuale,
+// copiati dal pulsante "Copia livelli per TradingView" della dashboard oppure
+// aggiornati in automatico da tv-sync, che scrive in_0 (livelli) e in_1 (meteo):
+// i primi due input devono restare questi e in quest'ordine.
+// Livelli: CODICE:prezzo;CODICE:prezzo;...  (es. "FLIP:80672;CW:90000;PW:85000;POC:83450")
+// Codici: VAH VAL POC LVN FLIP CW PW ICE ABS (gli altri compaiono in grigio).
+// Meteo: "⛅ Variabile · BTC · attesa · neutro" (asset, modello e bias facoltativi).
+//
+// Grafica (metodo dataviz): solo i tre livelli gamma hanno una tinta (flip, call
+// wall, put wall: palette validata, distinguibile anche con daltonismo); profilo
+// e orderflow sono in toni neutri, distinti da spessore e stile. Le linee partono
+// da una barra recente e finiscono sull'etichetta; le etichette sono pillole con
+// testo in inchiostro e i livelli vicini finiscono in un'unica etichetta.
+// ==============================================================================
+indicator("Meteo Livelli", "Meteo", overlay=true, max_lines_count=100, max_labels_count=100, max_boxes_count=100)
+
+G_LINES = "Linee"
+G_LABELS = "Etichette"
+G_PANEL = "Pannello meteo"
+G_COLORS = "Colori (sul grafico chiaro quelli non modificati passano alla variante chiara)"
+
+// in_0 e in_1: li scrive tv-sync. Non spostarli, non aggiungere input prima e non cambiarne
+// nome, gruppo o predefinito: al cambio di versione TradingView conserva i valori solo cosi'.
+levelsText = input.text_area("", "Livelli dalla dashboard", tooltip="Incolla qui il testo copiato dalla dashboard (lo aggiorna tv-sync).")
+weatherText = input.string("", "Meteo (opzionale)", tooltip="Es. \"⛅ Variabile · BTC · attesa · neutro\". Compare nel pannello meteo.")
+
+startBars = input.int(120, "Inizio linee (barre fa)", minval=1, maxval=5000, tooltip="Le linee partono da questa barra e arrivano alle etichette.", group=G_LINES)
+fullHistory = input.bool(false, "Estendi su tutto lo storico", group=G_LINES)
+showVA = input.bool(true, "Riempi la value area (VAL–VAH)", group=G_LINES)
+
+showLabels = input.bool(true, "Mostra etichette", group=G_LABELS)
+labelOffset = input.int(8, "Distanza dall'ultima barra (barre)", minval=1, maxval=200, group=G_LABELS)
+labelSizeIn = input.string("Normale", "Dimensione", options=["Piccola", "Normale", "Grande"], group=G_LABELS)
+showDist = input.bool(true, "Distanza % dal prezzo", group=G_LABELS)
+mergeAtr = input.float(0.25, "Unisci etichette entro (× ATR 14)", minval=0, maxval=5, step=0.05, tooltip="Livelli piu' vicini di questa soglia finiscono in un'unica etichetta su piu' righe. 0 = unisce solo i livelli allo stesso prezzo.", group=G_LABELS)
+
+showPanel = input.bool(true, "Mostra pannello", group=G_PANEL)
+panelPosIn = input.string("Al centro a destra", "Posizione", options=["In alto a sinistra", "In alto al centro", "In alto a destra", "Al centro a sinistra", "Al centro", "Al centro a destra", "In basso a sinistra", "In basso al centro", "In basso a destra"], tooltip="In alto a destra e in basso a destra ci sono gia' le tabelle di Cicli T-3 e FVG Entry.", group=G_PANEL)
+panelSizeIn = input.string("Normale", "Dimensione", options=["Piccola", "Normale", "Grande"], group=G_PANEL)
+
+colFlip = input.color(#3987E5, "Gamma flip", inline="gamma", group=G_COLORS)
+colCall = input.color(#199E70, "Call wall", inline="gamma", group=G_COLORS)
+colPut = input.color(#D95926, "Put wall", inline="gamma", group=G_COLORS)
+colPoc = input.color(#C3C2B7, "POC", inline="profilo", group=G_COLORS)
+colVa = input.color(#898781, "VAH / VAL", inline="profilo", group=G_COLORS)
+colLvn = input.color(#898781, "LVN", inline="profilo", group=G_COLORS)
+colIce = input.color(#FFFFFF, "Iceberg / assorbimento", group=G_COLORS)
+
+// ── Tema ──────────────────────────────────────────────────────────────────────
+// Inchiostro (testo) e varianti chiare della palette, scelti in base allo sfondo del grafico.
+bool isDark = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color) < 128
+color BG = chart.bg_color
+color INK = isDark ? #FFFFFF : #0B0B0B
+color INK2 = isDark ? #C3C2B7 : #52514E
+
+// Colore lasciato al default: sul grafico chiaro usa il passo chiaro della stessa tinta.
+themed(color c, color darkDefault, color lightDefault) =>
+    isDark or c != darkDefault ? c : lightDefault
+
+// Miscela opaca: la pillola copre gli altri disegni ma ha il tono della tinta su questo sfondo.
+mix(color base, color tint, float a) =>
+    color.rgb(color.r(base) + (color.r(tint) - color.r(base)) * a, color.g(base) + (color.g(tint) - color.g(base)) * a, color.b(base) + (color.b(tint) - color.b(base)) * a)
+
+color cFlip = themed(colFlip, #3987E5, #2A78D6)
+color cCall = themed(colCall, #199E70, #1BAF7A)
+color cPut = themed(colPut, #D95926, #EB6834)
+color cPoc = themed(colPoc, #C3C2B7, #52514E)
+color cVa = colVa
+// Velo della value area: inchiostro secondario al 7%, o il colore scelto se cambiato.
+color cVaWash = colVa == #898781 ? INK2 : colVa
+color cLvn = colLvn
+color cIce = themed(colIce, #FFFFFF, #0B0B0B)
+
+// ── Livelli ───────────────────────────────────────────────────────────────────
+var string[] RANKED = array.from("FLIP", "CW", "PW", "POC", "VAH", "VAL", "ICE", "ABS", "LVN")
+
+type Level
+    string code
+    float price
+    int row
+
+type Row
+    float price
+    string[] codes
+    string name
+    string tint
+    string topCode
+    bool mixed
+
+levelName(string code) =>
+    switch code
+        "FLIP" => "Gamma flip"
+        "CW" => "Call wall"
+        "PW" => "Put wall"
+        "ICE" => "Iceberg"
+        "ABS" => "Assorbimento"
+        => code
+
+// Priorita': ordine dei nomi sulla stessa riga e dei disegni (i piu' importanti sopra).
+levelRank(string code) =>
+    int i = array.indexof(RANKED, code)
+    i < 0 ? array.size(RANKED) : i
+
+levelColor(string code) =>
+    switch code
+        "FLIP" => cFlip
+        "CW" => cCall
+        "PW" => cPut
+        "POC" => cPoc
+        "VAH" => cVa
+        "VAL" => cVa
+        "LVN" => cLvn
+        "ICE" => cIce
+        "ABS" => cIce
+        => INK2
+
+// Livelli con lo stesso colore: servono a capire se una riga mescola colori diversi.
+colorKey(string code) =>
+    switch code
+        "VAL" => "VAH"
+        "ABS" => "ICE"
+        => array.indexof(RANKED, code) < 0 ? "?" : code
+
+isGamma(string code) =>
+    code == "FLIP" or code == "CW" or code == "PW"
+
+isZone(string code) =>
+    code == "ICE" or code == "ABS"
+
+// Nomi della riga in ordine di priorita'; call e put wall allo stesso prezzo diventano "Call + Put wall".
+rowName(string[] cs) =>
+    bool walls = array.includes(cs, "CW") and array.includes(cs, "PW")
+    string[] names = array.new<string>()
+    for c in RANKED
+        if array.includes(cs, c) and not (walls and c == "PW")
+            array.push(names, walls and c == "CW" ? "Call + Put wall" : levelName(c))
+    for c in cs
+        if array.indexof(RANKED, c) < 0
+            array.push(names, c)
+    array.join(names, " + ")
+
+// Prezzo arrotondato al tick, con separatori italiani (85.000,0).
+fmtPrice(float p) =>
+    string s = str.replace_all(str.tostring(math.round_to_mintick(p), format.mintick), ",", "")
+    string[] parts = str.split(s, ".")
+    string ip = array.get(parts, 0)
+    string out = ""
+    int n = str.length(ip)
+    for i = 0 to n - 1
+        out += str.substring(ip, i, i + 1)
+        int rest = n - 1 - i
+        if rest > 0 and rest % 3 == 0 and str.substring(ip, i, i + 1) != "-"
+            out += "."
+    array.size(parts) > 1 ? out + "," + array.get(parts, 1) : out
+
+fmtDist(float p) =>
+    float d = (p / close - 1) * 100
+    (d >= 0 ? "+" : "-") + str.replace_all(str.tostring(math.abs(d), "0.00"), ".", ",") + "%"
+
+padRight(string s, int w) =>
+    s + str.repeat(" ", math.max(0, w - str.length(s)))
+
+padLeft(string s, int w) =>
+    str.repeat(" ", math.max(0, w - str.length(s))) + s
+
+labelSize(string s) =>
+    switch s
+        "Piccola" => size.small
+        "Grande" => size.large
+        => size.normal
+
+// ── Pannello meteo ────────────────────────────────────────────────────────────
+panelPosition(string s) =>
+    switch s
+        "In alto a sinistra" => position.top_left
+        "In alto al centro" => position.top_center
+        "In alto a destra" => position.top_right
+        "Al centro a sinistra" => position.middle_left
+        "Al centro" => position.middle_center
+        "In basso a sinistra" => position.bottom_left
+        "In basso al centro" => position.bottom_center
+        "In basso a destra" => position.bottom_right
+        => position.middle_right
+
+capitalize(string s) =>
+    str.length(s) > 0 ? str.upper(str.substring(s, 0, 1)) + str.substring(s, 1) : s
+
+float atr = ta.atr(14)
+
+var line[] drawnLines = array.new<line>()
+var label[] drawnLabels = array.new<label>()
+var box[] drawnBoxes = array.new<box>()
+var table panel = showPanel ? table.new(panelPosition(panelPosIn), 2, 4, bgcolor=mix(BG, INK, 0.07), frame_color=mix(BG, INK, 0.18), frame_width=1, border_width=0) : na
+
+if barstate.islast
+    for ln in drawnLines
+        line.delete(ln)
+    for lb in drawnLabels
+        label.delete(lb)
+    for bx in drawnBoxes
+        box.delete(bx)
+    array.clear(drawnLines)
+    array.clear(drawnLabels)
+    array.clear(drawnBoxes)
+
+    // 1. Lettura: "CODICE:prezzo" separati da ";" o a capo; le voci malformate si saltano.
+    string[] codes = array.new<string>()
+    float[] prices = array.new<float>()
+    for item in str.split(str.replace_all(levelsText, "\n", ";"), ";")
+        string[] parts = str.split(str.trim(item), ":")
+        if array.size(parts) == 2 and array.size(codes) < 40
+            string code = str.upper(str.trim(array.get(parts, 0)))
+            string raw = str.trim(array.get(parts, 1))
+            float price = str.tonumber(str.contains(raw, ".") ? raw : str.replace_all(raw, ",", "."))
+            if str.length(code) > 0 and not na(price) and price > 0
+                array.push(codes, code)
+                array.push(prices, price)
+
+    // 2. Righe: livelli ordinati dall'alto; quelli allo stesso prezzo (al tick) condividono una riga.
+    Level[] levels = array.new<Level>()
+    Row[] rows = array.new<Row>()
+    if array.size(codes) > 0
+        int[] sorted = array.sort_indices(prices, order.descending)
+        for k in sorted
+            string code = array.get(codes, k)
+            float price = array.get(prices, k)
+            bool same = false
+            if array.size(rows) > 0
+                same := math.abs(array.last(rows).price - price) < syminfo.mintick / 2
+            if not same
+                array.push(rows, Row.new(price, array.new<string>()))
+            Row r = array.last(rows)
+            if not array.includes(r.codes, code)
+                array.push(r.codes, code)
+                array.push(levels, Level.new(code, price, array.size(rows) - 1))
+    for r in rows
+        r.name := rowName(r.codes)
+        r.topCode := array.get(r.codes, 0)
+        for c in r.codes
+            if levelRank(c) < levelRank(r.topCode)
+                r.topCode := c
+        string firstKey = colorKey(array.get(r.codes, 0))
+        r.mixed := false
+        r.tint := isGamma(array.get(r.codes, 0)) ? array.get(r.codes, 0) : ""
+        for c in r.codes
+            if colorKey(c) != firstKey
+                r.mixed := true
+                r.tint := ""
+
+    // 3. Disegni: linee da una barra recente fino all'etichetta.
+    int xStart = math.max(0, bar_index - startBars)
+    int xZone = math.max(0, bar_index - math.max(5, math.round(startBars / 4)))
+    int xEnd = bar_index + (showLabels ? labelOffset : 0)
+    extendMode = showLabels ? (fullHistory ? extend.left : extend.none) : (fullHistory ? extend.both : extend.right)
+    float unit = na(atr) ? close * 0.002 : atr
+
+    int iVah = array.indexof(codes, "VAH")
+    int iVal = array.indexof(codes, "VAL")
+    if showVA and iVah >= 0 and iVal >= 0
+        float top = math.max(array.get(prices, iVah), array.get(prices, iVal))
+        float bottom = math.min(array.get(prices, iVah), array.get(prices, iVal))
+        if top > bottom
+            array.push(drawnBoxes, box.new(xStart, top, xEnd, bottom, border_color=color(na), border_width=0, bgcolor=color.new(cVaWash, 93), extend=extendMode))
+
+    if array.size(levels) > 0
+        int[] ranks = array.new<int>()
+        for lv in levels
+            array.push(ranks, levelRank(lv.code))
+        // Dal meno importante al piu' importante: gamma flip e muri restano sopra.
+        for k in array.sort_indices(ranks, order.descending)
+            Level lv = array.get(levels, k)
+            color c = levelColor(lv.code)
+            if isZone(lv.code)
+                // Iceberg / assorbimento: fascia traslucida sottile, corta (evento recente).
+                float h = math.max(syminfo.mintick, unit * 0.06) / 2
+                array.push(drawnBoxes, box.new(xZone, lv.price + h, xEnd, lv.price - h, border_color=color(na), border_width=0, bgcolor=color.new(c, 68), extend=showLabels ? extend.none : extend.right))
+            else
+                Row r = array.get(rows, lv.row)
+                // Due livelli allo stesso prezzo: il piu' importante tratteggiato sopra l'altro (linea a due colori).
+                bool striped = r.mixed and lv.code == r.topCode
+                int width = isGamma(lv.code) or lv.code == "POC" ? 2 : 1
+                bool solid = isGamma(lv.code) or lv.code == "POC" or lv.code == "VAH" or lv.code == "VAL"
+                string style = striped ? line.style_dashed : solid ? line.style_solid : line.style_dotted
+                color lc = lv.code == "LVN" and isDark ? color.new(c, 30) : c
+                array.push(drawnLines, line.new(xStart, lv.price, xEnd, lv.price, extend=extendMode, color=lc, width=width, style=style))
+
+    // 4. Etichette: righe vicine (soglia in prezzo = altezza stimata di una riga) unite in una pillola.
+    if showLabels and array.size(rows) > 0
+        float rowH = mergeAtr * unit
+        int[] gFirst = array.new<int>()
+        int[] gLast = array.new<int>()
+        for i = 0 to array.size(rows) - 1
+            array.push(gFirst, i)
+            array.push(gLast, i)
+        bool merged = true
+        while merged and array.size(gFirst) > 1
+            merged := false
+            for g = 0 to array.size(gFirst) - 2
+                int a1 = array.get(gFirst, g)
+                int a2 = array.get(gLast, g)
+                int b1 = array.get(gFirst, g + 1)
+                int b2 = array.get(gLast, g + 1)
+                float midA = (array.get(rows, a1).price + array.get(rows, a2).price) / 2
+                float midB = (array.get(rows, b1).price + array.get(rows, b2).price) / 2
+                // Due pillole si toccano se i centri distano meno di meta' delle loro altezze sommate.
+                if midA - midB < (a2 - a1 + 1 + b2 - b1 + 1) / 2.0 * rowH
+                    array.set(gLast, g, b2)
+                    array.remove(gFirst, g + 1)
+                    array.remove(gLast, g + 1)
+                    merged := true
+                    break
+        for g = 0 to array.size(gFirst) - 1
+            int a = array.get(gFirst, g)
+            int b = array.get(gLast, g)
+            int wName = 0
+            int wPrice = 0
+            int wDist = 0
+            for i = a to b
+                Row r = array.get(rows, i)
+                wName := math.max(wName, str.length(r.name))
+                wPrice := math.max(wPrice, str.length(fmtPrice(r.price)))
+                wDist := math.max(wDist, str.length(fmtDist(r.price)))
+            string txt = ""
+            string tip = ""
+            string tint = array.get(rows, a).tint
+            for i = a to b
+                Row r = array.get(rows, i)
+                string line1 = padRight(r.name, wName) + "  " + padLeft(fmtPrice(r.price), wPrice) + (showDist ? "  " + padLeft(fmtDist(r.price), wDist) : "")
+                txt += (i > a ? "\n" : "") + line1
+                tip += (i > a ? "\n" : "") + r.name + ": " + fmtPrice(r.price) + " (" + fmtDist(r.price) + ")"
+                if r.tint != tint
+                    tint := ""
+            color pill = tint == "" ? mix(BG, INK, 0.14) : mix(BG, levelColor(tint), 0.22)
+            float mid = (array.get(rows, a).price + array.get(rows, b).price) / 2
+            array.push(drawnLabels, label.new(xEnd, mid, txt, color=pill, textcolor=INK, style=label.style_label_left, size=labelSize(labelSizeIn), textalign=text.align_left, text_font_family=font.family_monospace, tooltip=tip + "\nPrezzo: " + fmtPrice(close)))
+
+    // 5. Pannello meteo: legge "meteo · asset · modello · bias" in qualunque ordine (anche il formato vecchio).
+    if not na(panel)
+        table.clear(panel, 0, 0, 1, 3)
+        string wText = str.trim(str.replace_all(weatherText, "|", "·"))
+        if str.length(wText) > 0
+            string wKey = ""
+            string asset = ""
+            string model = ""
+            string bias = ""
+            string extra = ""
+            for raw in str.split(wText, "·")
+                string tok = str.trim(raw)
+                string lc = str.lower(tok)
+                if str.length(tok) > 0
+                    if wKey == "" and (str.contains(lc, "sereno") or str.contains(lc, "variabile") or str.contains(lc, "temporale"))
+                        wKey := str.contains(lc, "temporale") ? "temporale" : str.contains(lc, "variabile") ? "variabile" : "sereno"
+                    else if lc == "trend" or lc == "mean reversion" or lc == "attesa"
+                        model := capitalize(lc)
+                    else if lc == "long" or lc == "short" or lc == "neutro"
+                        bias := lc
+                    else if asset == "" and str.upper(tok) == tok and str.length(tok) <= 12
+                        asset := tok
+                    else
+                        extra += (extra == "" ? "" : " · ") + tok
+            string head = switch wKey
+                "sereno" => "☀️ Sereno"
+                "variabile" => "⛅ Variabile"
+                "temporale" => "⛈️ Temporale"
+                => extra != "" ? extra : wText
+            if wKey == ""
+                extra := ""
+            // Stato meteo con la scala di stato fissa (buono / attenzione / critico), sempre con icona e parola.
+            color status = switch wKey
+                "sereno" => #0CA30C
+                "variabile" => #FAB219
+                "temporale" => #D03B3B
+                => INK
+            color panelBg = mix(BG, INK, 0.07)
+            color headBg = mix(panelBg, status, wKey == "" ? 0.10 : 0.30)
+            headSize = panelSizeIn == "Piccola" ? size.small : panelSizeIn == "Grande" ? size.large : size.normal
+            bodySize = panelSizeIn == "Piccola" ? size.tiny : panelSizeIn == "Grande" ? size.normal : size.small
+            table.cell(panel, 0, 0, " " + head + " ", text_color=INK, text_halign=text.align_left, text_size=headSize, bgcolor=headBg)
+            table.cell(panel, 1, 0, asset == "" ? "" : " " + asset + " ", text_color=INK, text_halign=text.align_right, text_size=headSize, bgcolor=headBg)
+            int row = 1
+            if model != ""
+                table.cell(panel, 0, row, " Modello", text_color=INK2, text_halign=text.align_left, text_size=bodySize)
+                table.cell(panel, 1, row, model + " ", text_color=INK, text_halign=text.align_right, text_size=bodySize)
+                row += 1
+            if bias != ""
+                string glyph = bias == "long" ? "▲ " : bias == "short" ? "▼ " : "● "
+                table.cell(panel, 0, row, " Bias", text_color=INK2, text_halign=text.align_left, text_size=bodySize)
+                table.cell(panel, 1, row, glyph + capitalize(bias) + " ", text_color=INK, text_halign=text.align_right, text_size=bodySize)
+                row += 1
+            if extra != ""
+                table.cell(panel, 0, row, " Nota", text_color=INK2, text_halign=text.align_left, text_size=bodySize)
+                table.cell(panel, 1, row, extra + " ", text_color=INK, text_halign=text.align_right, text_size=bodySize)

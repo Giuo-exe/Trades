@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0c10">
+  <title>Meteo del Mercato</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div class="brand-text">
+          <h1>Meteo del Mercato</h1>
+          <p class="sub">Gamma · Orderflow · Livelli</p>
+        </div>
+      </div>
+      <div class="conn" role="status">
+        <span id="conn-dot" class="dot" aria-hidden="true"></span>
+        <span id="conn-text">Connessione…</span>
+        <span id="clock" class="clock"></span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="cards" class="cards" aria-live="polite" aria-label="Asset monitorati"></section>
+
+    <section id="detail" class="detail" hidden aria-labelledby="d-title">
+      <div class="detail-head">
+        <div class="detail-id">
+          <h2 id="d-title"></h2>
+          <p id="d-sub"></p>
+        </div>
+        <div class="detail-actions">
+          <button id="copy-levels" class="btn btn-primary" type="button">Copia livelli per TradingView</button>
+          <button id="close-detail" class="btn btn-icon" type="button" aria-label="Chiudi dettaglio">✕</button>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="panel chart-panel">
+          <div class="panel-head chart-head">
+            <div id="chart-title" class="panel-title">Prezzo 1m · CVD giornaliero</div>
+            <div id="tf-select" class="tf-select" role="group" aria-label="Timeframe del grafico">
+              <button type="button" data-tf="1m" title="1 minuto" aria-pressed="true">1m</button>
+              <button type="button" data-tf="3m" title="3 minuti" aria-pressed="false">3m</button>
+              <button type="button" data-tf="5m" title="5 minuti" aria-pressed="false">5m</button>
+              <button type="button" data-tf="15m" title="15 minuti" aria-pressed="false">15m</button>
+              <button type="button" data-tf="30m" title="30 minuti" aria-pressed="false">30m</button>
+              <button type="button" data-tf="45m" title="45 minuti" aria-pressed="false">45m</button>
+              <button type="button" data-tf="1h" title="1 ora" aria-pressed="false">1h</button>
+              <button type="button" data-tf="4h" title="4 ore" aria-pressed="false">4h</button>
+              <button type="button" data-tf="1d" title="1 giorno" aria-pressed="false">1d</button>
+            </div>
+          </div>
+          <div id="chart" class="chart"></div>
+          <p id="chart-note" class="panel-note warn" hidden></p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">GEX per strike</h3><span class="panel-unit">$ per 1%</span></div>
+          <canvas id="gex-canvas" class="side-canvas" aria-label="Gamma exposure netta per strike"></canvas>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">Volume profile di sessione</h3><span class="panel-unit">acquisti · vendite</span></div>
+          <canvas id="vp-canvas" class="side-canvas" aria-label="Volume profile della sessione, acquisti e vendite per prezzo"></canvas>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">Profondità book ±1%</h3><span class="panel-unit">$ esposti per fascia</span></div>
+          <canvas id="depth-canvas" class="side-canvas depth-canvas" aria-label="Liquidità esposta nel book entro ±1% dal prezzo"></canvas>
+          <p id="depth-note" class="panel-note quiet"></p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">Perché questo meteo</h3></div>
+          <ul id="d-reasons" class="reasons"></ul>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">Zone iceberg / assorbimento</h3></div>
+          <div id="d-zones" class="table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3 class="panel-title">Big trades</h3></div>
+          <div id="d-big" class="table-wrap"></div>
+        </div>
+      </div>
+    </section>
+    <p class="disclaimer">Lettura di contesto calcolata da dati pubblici (Binance, Deribit, CBOE ritardato 15 min). Non è un segnale operativo né una consulenza finanziaria.</p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

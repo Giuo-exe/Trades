@@ -1,0 +1,109 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "broadcastMs": 1000,
+  "assets": {
+    "BTC": {
+      "label": "Bitcoin",
+      "binanceSymbol": "BTCUSDT",
+      "profileTick": 25,
+      "bigTradeUsd": 250000,
+      "icebergMinUsd": 400000,
+      "gex": {
+        "source": "deribit",
+        "currencies": [
+          "BTC",
+          "USDC"
+        ],
+        "base": "BTC"
+      }
+    },
+    "ETH": {
+      "label": "Ethereum",
+      "binanceSymbol": "ETHUSDT",
+      "profileTick": 2,
+      "bigTradeUsd": 150000,
+      "icebergMinUsd": 250000,
+      "gex": {
+        "source": "deribit",
+        "currencies": [
+          "ETH",
+          "USDC"
+        ],
+        "base": "ETH"
+      }
+    },
+    "SOL": {
+      "label": "Solana",
+      "binanceSymbol": "SOLUSDT",
+      "profileTick": 0.1,
+      "bigTradeUsd": 75000,
+      "icebergMinUsd": 120000,
+      "gex": {
+        "source": "deribit",
+        "currencies": [
+          "USDC"
+        ],
+        "base": "SOL"
+      }
+    },
+    "GOLD": {
+      "label": "Oro (XAUUSDT perp · GEX da GLD)",
+      "binanceSymbol": "XAUUSDT",
+      "profileTick": 1,
+      "bigTradeUsd": 150000,
+      "icebergMinUsd": 250000,
+      "gex": {
+        "source": "cboe",
+        "symbol": "GLD",
+        "multiplier": 100
+      }
+    }
+  },
+  "gex": {
+    "maxExpiryDays": 45,
+    "deribitPollMs": 120000,
+    "cboePollMs": 300000,
+    "callSign": 1,
+    "putSign": -1,
+    "flipRangePct": 0.15
+  },
+  "orderflow": {
+    "cvdTrendMinutes": 15,
+    "cvdDirectionalRatio": 0.12,
+    "icebergWindowMs": 20000,
+    "icebergMinRatio": 3,
+    "zoneTtlMs": 14400000,
+    "bookBandPct": 0.25,
+    "bookSmoothingSec": 30,
+    "bookPrunePct": 3
+  },
+  "tradingview": {
+    "mcpPath": "C:/Users/giuli/Desktop/tradingview-mcp",
+    "dashboardUrl": "http://127.0.0.1:8080",
+    "syncMs": 15000,
+    "studyName": "Meteo Livelli",
+    "symbolAliases": {
+      "BTC": [
+        "BTC",
+        "XBT"
+      ],
+      "ETH": [
+        "ETH"
+      ],
+      "SOL": [
+        "SOL"
+      ],
+      "GOLD": [
+        "XAU",
+        "GOLD",
+        "GC",
+        "MGC",
+        "PAXG",
+        "TVC:GOLD"
+      ]
+    }
+  }
+}

@@ -1,0 +1,890 @@
+//@version=6
+// ==============================================================================
+// CICLI T-3: TREE & BACKTRACK V4
+// ==============================================================================
+// Motore ciclico speculare:
+// - indice: cicli T-3 costruiti sui minimi;
+// - inverso: cicli T-3i costruiti sui massimi.
+//
+// La compattazione deve restare lossless. Le funzioni comuni ricevono `isIndex`
+// e sostituiscono esclusivamente blocchi speculari; soglie, priorita, vincoli,
+// backtracking e ordine dei candidati non devono cambiare.
+// ==============================================================================
+indicator("Cicli T-3: Tree & Backtrack V4", "T-3 V4", overlay=true, scale=scale.none, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+import peppogiuo/CicliCore/1 as core
+
+// ==============================================================================
+// 1. CONFIGURAZIONE CICLICA E STORAGE GRAFICO
+// ==============================================================================
+grp_tf = "01 · OPERATIVITÀ"
+selectedTimeframe = input.timeframe("45", "Timeframe operativo", options=["15", "45"], group=grp_tf, inline="tf", tooltip="Il motore disegna soltanto quando il timeframe del grafico coincide con questo valore.")
+assetType = input.string("Crypto-Commodity", "Mercato", options=["Crypto-Commodity", "Indici Standard", "Indici MIB"], group=grp_tf, inline="tf")
+bool isStandardMarket = assetType == "Indici Standard"
+
+// Indici Standard: 21-44 barre. Crypto/Commodity/MIB: 24-45 con eccezione 23.
+cycleMinBars = isStandardMarket ? 21 : 24
+cycleMaxBars = isStandardMarket ? 44 : 45
+allow23Exception = not isStandardMarket
+float constraintAtr = ta.atr(14)
+
+// Finestre e anzianita minime dei raccordi intraday T-6, T-5 e T-4.
+// R(T-3) e' invece il solo ponte fra settimanali e viene risolto a parte.
+raccT4MinBars = isStandardMarket ? 12 : 11
+raccT4MaxBars = isStandardMarket ? 20 : 21
+raccT5MinBars = 6
+raccT5MaxBars = 10
+raccT6MinBars = 3
+raccT6MaxBars = 5
+raccT6MinAge = isStandardMarket ? 21 : 23
+raccT5MinAge = isStandardMarket ? 44 : 48
+raccT4MinAge = isStandardMarket ? 88 : 96
+newTLeftBars = isStandardMarket ? 21 : 23
+newTRightBars = isStandardMarket ? 44 : 48
+weeklyMinCycles = 6
+newTConfirmCycles = 11
+newTColor = color.yellow
+newTSoftColor = color.rgb(255, 245, 160)
+specialResetColor = color.rgb(80, 170, 255)
+emergencyRecoveryIndexColor = color.rgb(170, 88, 18)
+emergencyRecoveryInverseColor = color.rgb(155, 89, 182)
+alternativeCloseColor = #E74C3C
+// Cache per barra: il resolver rivalida la struttura prima del lookup weekly.
+// La chiave contiene lo start qualificato (na se invalido), non una copia della chain.
+var map<string, int> evolvedRankCache = map.new<string, int>()
+var table constraintTable = table.new(position.top_right, 3, 9, bgcolor=color.new(color.rgb(14, 20, 29), 12), frame_color=color.new(color.silver, 72), frame_width=1, border_color=color.new(color.silver, 86), border_width=1)
+t3MinBars = 2
+t2MinBars = 5
+t1MinBars = isStandardMarket ? 11 : 10
+rangeLegacyMaxBars = 44 // Solo blocker del range: non cambia il massimo del motore.
+int RACC_NONE = 0
+int RACC_T6 = 6
+int RACC_T5 = 5
+int RACC_T4 = 4
+int RACC_T3 = 3
+int RACC_INVALID = -1
+int RACC_RESET = -3
+int RACC_RECOVERY = -4
+var float[] fibLevels = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.414, 1.618, 2.272, 2.414, 2.618)
+
+grp_start = "01 · OPERATIVITÀ"
+startTimeIndex = input.time(timestamp("2025-04-07 05:20:00"), "Indice (Low)", group=grp_start, inline="start", confirm=true)
+startTimeInverse = input.time(timestamp("2025-04-07 07:20:00"), "Inverso (High)", group=grp_start, inline="start", confirm=true)
+grp_core = "02 · MOTORE T-3"
+currentCheckDelay = input.int(6, "Conferma DX", minval=5, maxval=10, group=grp_core, inline="engine", tooltip="Numero ordinario di barre della condizione destra. La recovery DX5 resta separata.")
+maxBacktrackDepth = input.int(4, "Profondita backtracking", minval=1, maxval=10, group=grp_core, inline="engine", tooltip="Quanti livelli risalire durante il backtracking.")
+fullBacktrackOnFailure = input.bool(true, "Backtracking completo su failure", group=grp_core, tooltip="Se una centratura produce vincoli o raccordi incoerenti, risale fino allo start disponibile.")
+grp_style = "03 · CICLI E CANDIDATI"
+cycleLabelLook = input.string("Pulito", "Label", options=["Pulito", "Classico"], group=grp_style, inline="look", tooltip="Pulito: testo ancorato a sinistra. Classico: box e orientamento originali.")
+cleanCycleLabels = cycleLabelLook == "Pulito"
+showDailyLines = input.bool(true, "Linee T-3", group=grp_style, inline="look")
+showRaccordoLines = input.bool(true, "Linee raccordi", group=grp_style, inline="look")
+cycleLineClearancePct = input.float(0.06, "Margine linea %", minval=0.0, maxval=0.5, step=0.01, group=grp_style, inline="offset", tooltip="Porta la linea oltre l'estremo senza cambiare i livelli logici.")
+cycleLabelGapPct = input.float(0.04, "Distanza testo %", minval=0.0, maxval=0.5, step=0.01, group=grp_style, inline="offset")
+grp_candidates = "03 · CICLI E CANDIDATI"
+showGhosts = input.bool(true, "Candidati ghost", group=grp_candidates, inline="cand")
+showConstraintAlternatives = input.bool(true, "Mostra centrature non vincolate", group=grp_candidates, tooltip="Con un vincolo principale attivo evidenzia con un pallino le sole centrature alternative ancora libere.")
+visibleConstraintAlternatives = input.int(2, "Alternative visibili", minval=1, maxval=3, group=grp_candidates, tooltip="Limita i pallini sul grafico; tutte le centrature valide continuano a influenzare lo score.")
+showBarCounter = input.bool(true, "Contatore barre", group=grp_candidates, inline="diag")
+grp_constraint = "04 · VINCOLI"
+weeklyConstraintEnabled = input.bool(true, "Vincolo settimanale", group=grp_constraint, tooltip="Colora i T-3 quando il settimanale risulta vincolato e ancora valido.")
+weeklyIndexColor = input.color(color.rgb(210, 45, 45), "Linea settimanale indice", group=grp_constraint, inline="week")
+weeklyInverseColor = input.color(color.rgb(0, 190, 140), "Linea settimanale inverso", group=grp_constraint, inline="week")
+showConstraintPanel = input.bool(true, "Score centrature vincolate", group=grp_constraint, inline="score", tooltip="Mostra fino a tre centrature vincolate per lato. Lo score e' strutturale, non una probabilita' di profitto.")
+showConstraintTiming = input.bool(true, "Mostra target minimo tempo vincolo", group=grp_constraint, inline="score")
+showPossibleConstraintRange = input.bool(false, "Vedi range possibile vincolo", group=grp_constraint)
+rangeSafeIndexColor = input.color(#2ECC71, "Range certo indice", group=grp_constraint, inline="range")
+rangeSafeInverseColor = input.color(#00BFA5, "Range certo inverso", group=grp_constraint, inline="range")
+rangeDoubtColor = input.color(#FFD54F, "Range dubbio", group=grp_constraint, inline="range-look")
+rangeOpacity = input.int(18, "Opacità range %", minval=0, maxval=100, group=grp_constraint, inline="range-look", tooltip="0 nasconde il colore; 100 lo rende pieno.")
+timingEarlyColor = input.color(#FFE0A3, "23 / 20", group=grp_constraint, inline="timing")
+timingMinColor = input.color(#FFB74D, "24 / 21", group=grp_constraint, inline="timing")
+timing44Color = input.color(#EF5350, "44", group=grp_constraint, inline="timing")
+showLockFibonacci = input.bool(false, "Fibonacci T-3", group=grp_constraint, inline="fib")
+showWeeklyLockFibonacci = input.bool(false, "Fibonacci settimanale", group=grp_constraint, inline="fib")
+grp_colors = "05 · STILE E COLORI"
+showEvolvedSwings = input.bool(false, "Debug view", group=grp_colors)
+showHigherAnalysis = input.bool(false, "Analisi evoluta T+1 / T+2", group=grp_colors, tooltip="Origini superiori indipendenti: 13/24 giornalieri chiusi; vincolo mensile da 6 chiusi. Le linee usano Debug view e Debug 1–4.")
+lineColorIndex = input.color(#FCCBCD, "Linea indice", group=grp_colors, inline="idx")
+labelColorIndex = input.color(#FFF4F6, "Testo indice", group=grp_colors, inline="idx")
+lineColorInverse = input.color(#C8E6C9, "Linea inverso", group=grp_colors, inline="inv")
+labelColorInverse = input.color(#F1FFF4, "Testo inverso", group=grp_colors, inline="inv")
+raccordoColor = input.color(#00BCD4, "Linea raccordo", group=grp_colors, inline="racc")
+labelColorRaccordo = input.color(#B2EBF2, "Testo raccordo", group=grp_colors, inline="racc")
+lineColorIndexLocked = input.color(color.rgb(220, 20, 60), "Linea indice vincolato", group=grp_colors, inline="idxv")
+lockedTextColorIndex = input.color(#FFE4E8, "Testo indice vincolato", group=grp_colors, inline="idxv")
+lineColorInverseLocked = input.color(color.rgb(0, 128, 0), "Linea inverso vincolato", group=grp_colors, inline="invv")
+lockedTextColorInverse = input.color(#E8FFF0, "Testo inverso vincolato", group=grp_colors, inline="invv")
+ghostColor = input.color(#95A5A6, "Candidati", group=grp_colors)
+alternativeOpenColor = input.color(#2ECC71, "Alternative", group=grp_colors, inline="alt-mark")
+alternativeMarkerShape = input.string("Cerchio", "Forma", options=["Cerchio", "Diamante", "Quadrato", "Triangolo"], group=grp_colors, inline="alt-mark")
+swingT3Color = input.color(#FFFFFF00, "Debug 1", group=grp_colors, inline="swing")
+swingTColor = input.color(#00E5FF00, "Debug 2", group=grp_colors, inline="swing")
+swingT1Color = input.color(#B388FF00, "Debug 3", group=grp_colors, inline="swing")
+swingT2Color = input.color(#FF6EC700, "Debug 4", group=grp_colors, inline="swing")
+grp_prosp = "06 · PROSPETTICI"
+prospT3Color = input.color(#9B59B6, "T-3", group=grp_prosp, inline="pcol")
+prospT2Color = input.color(#F39C12, "T-2", group=grp_prosp, inline="pcol")
+prospT1Color = input.color(#3498DB, "T-1", group=grp_prosp, inline="pcol")
+prospMarkerShape = input.string("Croce", "Forma", options=["Cerchio", "Diamante", "Quadrato", "Triangolo", "Croce", "X"], group=grp_prosp, inline="pshape")
+prospMarkerSize = input.string("Small", "Marker", options=["Tiny", "Small", "Normal", "Large"], group=grp_prosp, inline="pshape")
+prospTextSize = input.string("Normal", "Testo", options=["Tiny", "Small", "Normal", "Large"], group=grp_prosp, inline="pshape")
+prospShowShape = input.bool(true, "Forma", group=grp_prosp, inline="pvis")
+prospShowText = input.bool(true, "Testo", group=grp_prosp, inline="pvis")
+prospOffsetPct = input.float(0.12, "Offset %", minval=0.0, maxval=2.0, step=0.01, group=grp_prosp, inline="poff")
+prospTextGapPct = input.float(0.08, "Gap testo %", minval=0.0, maxval=1.0, step=0.01, group=grp_prosp, inline="poff")
+prospCurrentExtraPct = input.float(0.22, "Extra corrente %", minval=0.0, maxval=1.0, step=0.01, group=grp_prosp)
+grp_advanced = "07 · AVANZATE"
+debugMode = input.bool(false, "Debug", group=grp_advanced)
+
+constraintRow(int row, string txt0, string txt1, string txt2, color fg0, color fg1, color fg2, color bg) =>
+	for col = 0 to 2
+		table.cell(constraintTable, col, row, col == 0 ? txt0 : col == 1 ? txt1 : txt2, text_color=col == 0 ? fg0 : col == 1 ? fg1 : fg2, bgcolor=bg, text_size=size.tiny)
+
+// EP draft: gli input e il loop restano nell'indicatore; il motore e i tipi sono nella libreria.
+var core.SideRuntime indexRuntime = core.newSideRuntime()
+var core.SideRuntime inverseRuntime = core.newSideRuntime()
+map<string, line> drawnSwingLines = na
+map<string, label> drawnSwingLabels = na
+map<string, int> drawnSwingKinds = na
+core.EngineConfig cfg = core.EngineConfig.new(cycleMinBars, cycleMaxBars, allow23Exception, raccT4MinBars, raccT4MaxBars, raccT6MinAge, raccT5MinAge, raccT4MinAge, newTLeftBars, newTRightBars, t1MinBars, currentCheckDelay, maxBacktrackDepth, fullBacktrackOnFailure, cleanCycleLabels, showDailyLines, showRaccordoLines, cycleLineClearancePct, cycleLabelGapPct, showGhosts, weeklyConstraintEnabled, weeklyIndexColor, weeklyInverseColor, showEvolvedSwings, showHigherAnalysis, lineColorIndex, labelColorIndex, lineColorInverse, labelColorInverse, raccordoColor, labelColorRaccordo, lineColorIndexLocked, lockedTextColorIndex, lineColorInverseLocked, lockedTextColorInverse, ghostColor, swingT3Color, swingTColor, swingT1Color, swingT2Color, prospT3Color, prospT2Color, prospT1Color, prospMarkerShape, prospMarkerSize, prospTextSize, prospShowShape, prospShowText, prospOffsetPct, prospTextGapPct, prospCurrentExtraPct, debugMode)
+
+// 15. MAIN BAR-BY-BAR
+// ==============================================================================
+// Il motore intraday e' attivo soltanto sul timeframe selezionato. Cambiare il
+// grafico da 45m a 15m non deve lasciare visibili chain calcolate sull'altro TF.
+float chartTfSeconds = timeframe.in_seconds()
+float selectedTfSeconds = timeframe.in_seconds(selectedTimeframe)
+bool renderEnabled = timeframe.isminutes and chartTfSeconds == selectedTfSeconds
+drawnSwingLines := renderEnabled and barstate.islast ? map.new<string, line>() : na
+drawnSwingLabels := renderEnabled and barstate.islast ? map.new<string, label>() : na
+drawnSwingKinds := renderEnabled and barstate.islast ? map.new<string, int>() : na
+core.EngineContext ctx = core.EngineContext.new(indexRuntime, inverseRuntime, evolvedRankCache, drawnSwingLines, drawnSwingLabels, drawnSwingKinds)
+
+if not renderEnabled
+	// Sul timeframe errato non restano ne' oggetti ne' stato del motore.
+	for side = 0 to 1
+		bool isIndex = side == 0
+		core.SideRuntime resources = core.sideRuntime(ctx, isIndex)
+		core.clearChain(resources.chain)
+		core.clearChain(resources.weeklyHistory)
+		core.clearLabelStore(resources.newTLabels)
+		core.clearLabelStore(resources.ghostLabels)
+		core.clearLabelStore(resources.scenarioLabels)
+		core.clearLineStore(resources.swingLines)
+		core.clearLineStore(resources.timingLines)
+		core.clearFibObjects(resources.fibLockLines, resources.fibLockLabels)
+		core.clearFibObjects(resources.fibWeeklyLines, resources.fibWeeklyLabels)
+		label.delete(resources.counterLabel)
+		array.clear(resources.triedStarts)
+		resources.startBar := na
+		resources.previousWeeklyStart := na
+		resources.weeklyContextStart := na
+		resources.weeklyWarning := false
+		resources.lockCandidateBar := na
+		resources.firstLockBar := na
+		resources.weeklyLocked := false
+		resources.preLockAlert := false
+		resources.counterLabel := na
+	if barstate.islast
+		table.clear(constraintTable, 0, 0, 2, 8)
+	map.clear(evolvedRankCache)
+else
+	for side = 0 to 1
+		bool isIndex = side == 0
+		core.SideRuntime sideState = core.sideRuntime(ctx, isIndex)
+		int startTarget = isIndex ? startTimeIndex : startTimeInverse
+		bool startReached = time >= startTarget and (barstate.isfirst or na(time[1]) or time[1] < startTarget)
+		if na(sideState.startBar) and startReached
+			sideState.startBar := bar_index
+			sideState.weeklyContextStart := bar_index
+			float price = core.sidePivot(isIndex)
+			color baseColor = isIndex ? lineColorIndex : lineColorInverse
+			core.CycleNode root = core.createNode(0, bar_index, price, price, bar_index, RACC_NONE)
+			root.weeklyOrder := showHigherAnalysis ? 1 : 0
+			color visibleLine = showDailyLines ? baseColor : color(na)
+			root.lnCycle := core.cycleHorizontal(time, price, time, visibleLine)
+			root.lnVert := core.cycleVertical(time, price, visibleLine)
+			root.lblInfo := core.cycleTimeLabel(cfg, isIndex, time, price, isIndex ? "T" : "Ti", baseColor, core.dailyTextColor(cfg, isIndex, false), size.large)
+			array.push(core.sideRuntime(ctx, isIndex).chain, root)
+	// 0: rebase materializzati. 1: vincolo, origini virtuali, R(T-3).
+	// 2: solo dopo processChain, recovery weekly dalla centratura persa.
+	for weeklyPass = 0 to 2
+		if weeklyPass == 1
+			for side = 0 to 1
+				bool isIndex = side == 0
+				core.SideRuntime weeklyState = core.sideRuntime(ctx, isIndex)
+				if array.size(weeklyState.chain) > 0
+					core.CycleNode weeklyRoot = core.weeklyRootNode(ctx, isIndex, weeklyState.chain)
+					core.weeklyConstraintStep(cfg, isIndex, weeklyState, bar_index, core.sidePivot(isIndex), weeklyRoot.startPrice)
+		else if weeklyPass == 2
+			for side = 0 to 1
+				bool isIndex = side == 0
+				core.processChain(cfg, ctx, isIndex, core.sideRuntime(ctx, isIndex))
+		for side = 0 to 1
+			bool isIndex = side == 0
+			core.SideRuntime weeklyState = core.sideRuntime(ctx, isIndex)
+			bool weeklyApplied = false
+			int weeklyAttempts = weeklyPass == 1 ? 2 : 1
+			for weeklyAttempt = 0 to weeklyAttempts - 1
+				if not weeklyApplied
+					int nextStart = na
+					int parentBar = na
+					int contextStart = weeklyState.startBar
+					bool keepContext = false
+					int policy = RACC_NONE
+					if weeklyPass < 2 and weeklyAttempt == 0 and array.size(weeklyState.chain) > 0
+						[selectedStart, selectedContext, selectedKeep, selectedParent] = core.selectWeeklyOrigin(cfg, ctx, isIndex, weeklyState.chain, weeklyPass == 0)
+						nextStart := selectedStart
+						parentBar := selectedParent
+						contextStart := selectedContext
+						keepContext := selectedKeep
+					else if weeklyPass == 1 or weeklyPass == 2
+						bool bridge = weeklyPass == 1
+						parentBar := bridge and array.size(weeklyState.chain) > 0 ? array.last(weeklyState.chain).startBar : na
+						nextStart := core.weeklyFallbackPoint(cfg, ctx, isIndex, weeklyState, bridge)
+						policy := bridge ? RACC_T3 : RACC_RECOVERY
+					if not na(nextStart) and nextStart != weeklyState.startBar
+						weeklyApplied := core.commitWeeklyFallback(cfg, ctx, isIndex, weeklyState, nextStart, parentBar, contextStart, keepContext, policy)
+	if array.size(indexRuntime.chain) > 0 and array.size(inverseRuntime.chain) > 0
+		core.CycleNode currentIndex = array.last(indexRuntime.chain)
+		core.CycleNode currentInverse = array.last(inverseRuntime.chain)
+		if currentIndex.isLocked and currentInverse.isLocked and not currentIndex.isClosed and not currentInverse.isClosed
+			int indexLockBar = core.firstLockBarUntil(cfg, true, currentIndex.startBar, currentIndex.startPrice, bar_index)
+			int inverseLockBar = core.firstLockBarUntil(cfg, false, currentInverse.startBar, currentInverse.startPrice, bar_index)
+			if not na(indexLockBar) and not na(inverseLockBar)
+				if indexLockBar != inverseLockBar
+					bool recenterIndex = indexLockBar < inverseLockBar
+					core.SideRuntime recenterState = core.sideRuntime(ctx, recenterIndex)
+					core.CycleNode[] recenterChain = recenterState.chain
+					bool recenterApplied = false
+					if array.size(recenterChain) > 0 and not na(recenterState.startBar)
+						core.CycleNode recenterCurrent = array.last(recenterChain)
+						bool recenterEligible = core.isActiveRegularNode(recenterCurrent) and recenterCurrent.isLocked
+						bool viableCanonical = false
+						bool parentContinuation = false
+						if recenterEligible
+							core.Candidate[] recenterCandidates = core.scanCandidates(cfg, recenterIndex, recenterCurrent.startBar)
+							for c in recenterCandidates
+								bool canonicalOk = c.sequenceValid and core.isConfirmedCanonicalCandidate(cfg, c)
+								bool constraintOk = canonicalOk and c.constraintOk
+								bool preLockOk = constraintOk and not core.wouldHavePreLockInvalidation(cfg, recenterIndex, recenterCurrent.startBar, recenterCurrent.startPrice, c.barIdx, core.diagnosticCandidateOk(cfg, c))
+								if preLockOk
+									viableCanonical := true
+									break
+							if array.size(recenterChain) >= 2
+								core.CycleNode recenterParent = array.get(recenterChain, array.size(recenterChain) - 2)
+								if recenterParent.raccType == RACC_NONE
+									core.refreshCandidatesPreservingAttempts(cfg, recenterIndex, recenterParent)
+									parentContinuation := not na(core.selectContinuationPick(cfg, ctx, recenterIndex, recenterParent, 3, false, recenterCurrent.startBar, na))
+						if recenterEligible and not viableCanonical and not parentContinuation
+							recenterApplied := core.resolveLocalLockedRaccordo(cfg, ctx, recenterIndex, recenterState, true)
+						if recenterApplied
+							core.CycleNode newCurrent = array.last(recenterChain)
+							newCurrent.candidates := core.scanCandidates(cfg, recenterIndex, newCurrent.startBar)
+							array.clear(recenterState.triedStarts)
+	for side = 0 to 1
+		bool isIndex = side == 0
+		core.SideRuntime recenterState = core.sideRuntime(ctx, isIndex)
+		core.CycleNode[] recenterChain = recenterState.chain
+		int recenterSize = array.size(recenterChain)
+		int raccordoPos = na
+		int childPos = na
+		int parentPos = na
+		if recenterSize >= 4 and not na(recenterState.startBar)
+			for pos = recenterSize - 1 to 0
+				core.CycleNode node = array.get(recenterChain, pos)
+				if na(raccordoPos) and pos < recenterSize - 1 and core.isRaccordo(node)
+					raccordoPos := pos
+				else if not na(raccordoPos) and na(parentPos) and not core.isRaccordo(node) and node.raccType != RACC_RESET and node.raccType != RACC_RECOVERY
+					if na(childPos)
+						childPos := pos
+					else
+						parentPos := pos
+		if not na(parentPos) and not na(childPos)
+			core.CycleNode parent = array.get(recenterChain, parentPos)
+			core.CycleNode chosenChild = array.get(recenterChain, childPos)
+			core.CycleNode raccordo = array.get(recenterChain, raccordoPos)
+			parent.candidates := core.scanCandidates(cfg, isIndex, parent.startBar)
+			int chosenScore = na
+			core.Candidate best = na
+			int bestScore = na
+			for pass = 0 to 1
+				if pass == 0 or not na(chosenScore)
+					for c in parent.candidates
+						bool evaluate = pass == 0 ? c.barIdx == chosenChild.startBar : c.barIdx != chosenChild.startBar and c.barIdx < raccordo.startBar and c.sequenceValid and core.isConfirmedCanonicalCandidate(cfg, c) and c.constraintOk
+						if evaluate
+							core.ContinuationPick candidatePick = core.candidateContinuationPick(cfg, ctx, isIndex, c)
+							if pass == 0
+								chosenScore := candidatePick.score
+							else
+								bool better = candidatePick.mode == 1 and candidatePick.score > chosenScore and (na(best) or candidatePick.score > bestScore or (candidatePick.score == bestScore and core.candidateTieBetter(cfg, ctx, isIndex, parent.startBar, c, best, true)))
+								if better
+									best := c
+									bestScore := candidatePick.score
+			if not na(best)
+				core.trimChainTo(recenterChain, parentPos + 1)
+				core.closeDailyAtCandidate(cfg, isIndex, parent, best, true)
+				core.CycleNode replacement = core.buildDailyNode(cfg, parent.id + 1, best.barIdx, best.price, isIndex, true)
+				array.push(recenterChain, replacement)
+				replacement.candidates := core.scanCandidates(cfg, isIndex, replacement.startBar)
+				array.clear(recenterState.triedStarts)
+	for side = 0 to 1
+		bool isIndex = side == 0
+		core.SideRuntime capState = core.sideRuntime(ctx, isIndex)
+		core.CycleNode[] capChain = capState.chain
+		int visibleCount = 0
+		int twelfthPos = na
+		if array.size(capChain) > 0
+			for i = 0 to array.size(capChain) - 1
+				if core.isVisibleDailyNode(array.get(capChain, i))
+					visibleCount += 1
+					if visibleCount == 12
+						twelfthPos := i
+						core.CycleNode twelfth = array.get(capChain, i)
+						if twelfth.raccType == RACC_NONE
+							label.set_text(twelfth.lblInfo, "R(T-3)?")
+		if visibleCount > 12 and not na(twelfthPos)
+			core.trimChainTo(capChain, twelfthPos + 1)
+			core.CycleNode capTail = array.get(capChain, twelfthPos)
+			capTail.isClosed := false
+			line.set_x2(capTail.lnCycle, time)
+			capTail.candidates := core.scanCandidates(cfg, isIndex, capTail.startBar)
+			array.clear(capState.triedStarts)
+	core.CycleNode[] indexView = core.weeklyContextView(ctx, true, indexRuntime.chain)
+	core.CycleNode[] inverseView = core.weeklyContextView(ctx, false, inverseRuntime.chain)
+	int indexLock = core.weeklyCandidateLockBar(true, indexRuntime.startBar, core.sidePivotOnBar(true, indexRuntime.startBar))
+	int inverseLock = core.weeklyCandidateLockBar(false, inverseRuntime.startBar, core.sidePivotOnBar(false, inverseRuntime.startBar))
+	bool weeklyConflict = false
+	if not na(indexLock) and not na(inverseLock)
+		int overlapFrom = math.max(indexRuntime.startBar, inverseRuntime.startBar)
+		int conflictBar = math.max(indexLock, inverseLock)
+		bool indexClosed = core.weeklyClosedBefore(cfg, ctx, true, indexView, indexRuntime.startBar, conflictBar)
+		bool inverseClosed = core.weeklyClosedBefore(cfg, ctx, false, inverseView, inverseRuntime.startBar, conflictBar)
+		weeklyConflict := conflictBar >= overlapFrom and not (indexClosed or inverseClosed)
+	bool indexOldWeeklyInvalidated = false
+	bool inverseOldWeeklyInvalidated = false
+	for side = 0 to 1
+		bool isIndex = side == 0
+		core.SideRuntime state = core.sideRuntime(ctx, isIndex)
+		bool lockVisible = not na(isIndex ? indexLock : inverseLock)
+		bool finalNeedsInvalidation = barstate.islast and state.weeklyLocked and array.size(state.chain) > 0 and (weeklyConstraintEnabled or not na(state.lockCandidateBar))
+		bool oldInvalidated = (lockVisible or finalNeedsInvalidation) and core.oldWeeklyConstraintInvalidated(cfg, ctx, isIndex, state)
+		// La seconda rottura mette in dubbio la lettura opposta precedente.
+		// Una stessa candela non permette di ordinare le due wick.
+		state.weeklyWarning := lockVisible and oldInvalidated or weeklyConflict and (isIndex ? inverseLock >= indexLock : indexLock >= inverseLock)
+		if isIndex
+			indexOldWeeklyInvalidated := oldInvalidated
+		else
+			inverseOldWeeklyInvalidated := oldInvalidated
+	if barstate.islast
+		int[] regularLockBars = array.new_int(2, na)
+		int[] weeklyFibBars = array.new_int(2, na)
+		bool[] weeklyInvalidatedSides = array.new_bool(2, false)
+		for side = 0 to 1
+			bool isIndex = side == 0
+			core.CycleNode[] chain = core.sideRuntime(ctx, isIndex).chain
+			core.SideRuntime sideState = core.sideRuntime(ctx, isIndex)
+			int sizeAfter = array.size(chain)
+			bool weeklyInvalidated = sideState.weeklyLocked and sizeAfter > 0 and (weeklyConstraintEnabled or not na(sideState.lockCandidateBar)) and (isIndex ? indexOldWeeklyInvalidated : inverseOldWeeklyInvalidated)
+			for finalNode in chain
+				if not core.isVisibleDailyNode(finalNode)
+					bool finalRaccordo = core.isRaccordo(finalNode)
+					core.paint(finalNode, cfg, finalRaccordo ? raccordoColor : specialResetColor, finalRaccordo ? labelColorRaccordo : core.dailyTextColor(cfg, isIndex, finalNode.isLocked), finalRaccordo ? 80 : 45)
+			core.renderNewTLabelsFor(cfg, ctx, isIndex, sideState, true, weeklyInvalidated)
+			core.refreshCycleGeometry(cfg, isIndex, chain)
+			int regularLockBar = na
+			if array.size(chain) > 0
+				core.CycleNode current = array.last(chain)
+				if core.isActiveRegularNode(current) and current.isLocked
+					regularLockBar := core.firstLockBarUntil(cfg, isIndex, current.startBar, current.startPrice, bar_index)
+			bool weeklyFibEligible = sideState.weeklyLocked and not na(sideState.lockCandidateBar) and array.size(chain) > 0 and not weeklyInvalidated
+			int weeklyFibBar = weeklyFibEligible ? sideState.lockCandidateBar + newTRightBars : na
+			array.set(regularLockBars, side, regularLockBar)
+			array.set(weeklyFibBars, side, weeklyFibBar)
+			array.set(weeklyInvalidatedSides, side, weeklyInvalidated)
+		// A parita' di barra entrambi i lati restano visibili: gli store grafici sono separati.
+		for side = 0 to 1
+			bool isIndex = side == 0
+			core.CycleNode[] chain = core.sideRuntime(ctx, isIndex).chain
+			core.SideRuntime sideState = core.sideRuntime(ctx, isIndex)
+			int regularLockBar = array.get(regularLockBars, side)
+			int regularOtherBar = array.get(regularLockBars, 1 - side)
+			int weeklyFibBar = array.get(weeklyFibBars, side)
+			int weeklyOtherBar = array.get(weeklyFibBars, 1 - side)
+			bool latestRegular = not na(regularLockBar) and (na(regularOtherBar) or regularLockBar >= regularOtherBar)
+			bool latestWeekly = not na(weeklyFibBar) and (na(weeklyOtherBar) or weeklyFibBar >= weeklyOtherBar)
+			for fibKind = 0 to 1
+				bool weekly = fibKind == 1
+				bool ufSelected = weekly ? latestWeekly : latestRegular
+				bool ufWeeklyInvalidated = array.get(weeklyInvalidatedSides, side)
+				core.CycleNode[] ufChain = sideState.chain
+				line[] ufLines = weekly ? sideState.fibWeeklyLines : sideState.fibLockLines
+				label[] ufLabels = weekly ? sideState.fibWeeklyLabels : sideState.fibLockLabels
+				bool ufDailyVisible = not weekly and showLockFibonacci
+				bool ufWeeklyVisible = weekly and showWeeklyLockFibonacci and weeklyConstraintEnabled and sideState.weeklyLocked and not na(sideState.firstLockBar) and not ufWeeklyInvalidated
+				bool ufVisible = ufSelected and array.size(ufChain) > 0 and (ufDailyVisible or ufWeeklyVisible)
+				color ufBase = weekly ? (isIndex ? weeklyIndexColor : weeklyInverseColor) : (isIndex ? lineColorIndexLocked : lineColorInverseLocked)
+				color ufDanger = weekly ? color.rgb(210, 130, 255) : color.rgb(255, 110, 80)
+				int ufFibStartBar = na
+				int ufFibStartTime = na
+				int ufFibExtremeTime = na
+				float ufFibStartPrice = na
+				float ufFibExtreme = na
+				if ufVisible
+					core.CycleNode ufCurrent = array.last(ufChain)
+					// La radice weekly e il contesto devono coincidere: non disegnare ancore miste.
+					core.CycleNode ufRoot = weekly ? core.weeklyRootNode(ctx, isIndex, ufChain) : ufCurrent
+					int ufAnchorBar = weekly ? sideState.startBar : ufCurrent.startBar
+					bool ufAnchorInRange = (not weekly or not na(ufRoot) and ufRoot.startBar == ufAnchorBar) and not na(ufAnchorBar) and core.scanOffsetOk(bar_index - ufAnchorBar)
+					float ufAnchorPrice = na
+					if ufAnchorInRange
+						ufAnchorPrice := weekly ? ufRoot.startPrice : ufCurrent.startPrice
+					int ufLockBar = weekly ? sideState.firstLockBar : ufAnchorInRange ? core.firstLockBarUntil(cfg, isIndex, ufAnchorBar, ufAnchorPrice, bar_index) : na
+					bool ufAnchorOk = weekly or (core.isActiveRegularNode(ufCurrent) and ufCurrent.isLocked and not ufCurrent.preLockInvalidated)
+					bool ufLockOk = not na(ufLockBar) and ufLockBar > ufAnchorBar and ufLockBar <= bar_index
+					if ufAnchorOk and ufAnchorInRange and not na(ufAnchorPrice) and ufLockOk
+						[ufPreExtreme, ufPreExtremeBar] = core.scanPreLockExtreme(isIndex, ufAnchorBar, ufLockBar)
+						if not na(ufPreExtremeBar) and core.scanOffsetOk(bar_index - ufPreExtremeBar)
+							ufFibStartBar := ufAnchorBar
+							ufFibStartTime := core.historyTimeAt(ufAnchorBar)
+							ufFibExtremeTime := core.historyTimeAt(ufPreExtremeBar)
+							ufFibStartPrice := ufAnchorPrice
+							ufFibExtreme := ufPreExtreme
+				bool ufFibOk = not na(ufFibStartBar) and not na(ufFibStartTime) and not na(ufFibExtremeTime) and not na(ufFibStartPrice) and not na(ufFibExtreme) and ufFibStartPrice != ufFibExtreme
+				if ufFibOk
+					int ufLabelCount = 7
+					bool ufRecreate = array.size(ufLines) != 14 or array.size(ufLabels) != ufLabelCount
+					color ufGuideColor = color.new(ufBase, 56)
+					if ufRecreate
+						core.clearFibObjects(ufLines, ufLabels)
+						array.push(ufLines, line.new(ufFibStartTime, ufFibStartPrice, ufFibExtremeTime, ufFibExtreme, xloc=xloc.bar_time, color=ufGuideColor, width=1, style=line.style_arrow_right, force_overlay=true))
+					line ufGuide = array.get(ufLines, 0)
+					line.set_xy1(ufGuide, ufFibStartTime, ufFibStartPrice)
+					line.set_xy2(ufGuide, ufFibExtremeTime, ufFibExtreme)
+					line.set_color(ufGuide, ufGuideColor)
+					line.set_style(ufGuide, line.style_arrow_right)
+					int ufLabelSlot = 0
+					string ufLabelPrefix = (weekly ? "SET" : "T3") + (isIndex ? " I " : " Inv ")
+					for ufI = 0 to 12
+						bool ufPrimary = ufI == 0 or ufI == 2 or ufI == 3 or ufI == 4 or ufI == 6
+						bool ufExtensionAccent = ufI == 7 or ufI == 9
+						bool ufHasLabel = ufPrimary or ufExtensionAccent
+						if ufRecreate
+							array.push(ufLines, line.new(ufFibExtremeTime, ufFibStartPrice, time, ufFibStartPrice, xloc=xloc.bar_time, color=color(na), force_overlay=true))
+							if ufHasLabel
+								string ufRatio = ufI == 0 ? "0 pre-lock" : ufI == 2 ? ".382" : ufI == 3 ? ".5" : ufI == 4 ? ".618" : ufI == 6 ? "1 origine" : str.tostring(array.get(fibLevels, ufI))
+								array.push(ufLabels, core.plainTimeLabel(time, ufFibStartPrice, ufLabelPrefix + ufRatio, color.new(color.white, 12), size.tiny))
+						float ufPrice = ufFibExtreme + (ufFibStartPrice - ufFibExtreme) * array.get(fibLevels, ufI)
+						line ufLn = array.get(ufLines, ufI + 1)
+						line.set_xy1(ufLn, ufFibExtremeTime, ufPrice)
+						line.set_xy2(ufLn, time, ufPrice)
+						color ufLevelColor = core.fibLockColor(ufBase, ufDanger, ufI)
+						line.set_color(ufLn, color.new(ufLevelColor, ufPrimary ? 10 : ufExtensionAccent ? 42 : ufI >= 7 ? 70 : 76))
+						line.set_width(ufLn, ufPrimary or ufExtensionAccent ? 2 : 1)
+						line.set_style(ufLn, ufI == 0 or ufI == 6 ? line.style_solid : ufPrimary or ufExtensionAccent ? line.style_dashed : line.style_dotted)
+						if ufHasLabel
+							label ufLbl = array.get(ufLabels, ufLabelSlot)
+							label.set_xy(ufLbl, time, ufPrice)
+							label.set_textcolor(ufLbl, color.new(ufLevelColor, ufPrimary ? 0 : 30))
+							label.set_size(ufLbl, ufPrimary ? size.small : size.tiny)
+							ufLabelSlot += 1
+				else if array.size(ufLines) > 0 or array.size(ufLabels) > 0
+					core.clearFibObjects(ufLines, ufLabels)
+			if showBarCounter
+				label nextCounterLabel = sideState.counterLabel
+				if array.size(chain) > 0
+					core.CycleNode counterNode = array.last(chain)
+					int counterDuration = core.cycleDurationFrom(isIndex, counterNode.startBar, bar_index)
+					int lastAltBar = 0
+					for c in counterNode.candidates
+						bool constraintOk = c.constraintOk
+						if core.isConfirmedCanonicalCandidate(cfg, c) and c.barIdx > lastAltBar and constraintOk
+							lastAltBar := c.barIdx
+					string counterText = lastAltBar > counterNode.startBar ? str.tostring(lastAltBar - counterNode.startBar) + "+" + str.tostring(bar_index - lastAltBar) : str.tostring(counterDuration)
+					if core.isWaitingDecision(counterNode) or counterDuration >= cycleMaxBars
+						counterText += " Attesa"
+					color glowColor = counterNode.isLocked ? (isIndex ? lineColorIndexLocked : lineColorInverseLocked) : (isIndex ? lineColorIndex : lineColorInverse)
+					label.delete(nextCounterLabel)
+					nextCounterLabel := core.plainTimeLabel(time, isIndex ? low * 0.999 : high * 1.001, counterText, glowColor, size.normal)
+				sideState.counterLabel := nextCounterLabel
+			else
+				label.delete(sideState.counterLabel)
+				sideState.counterLabel := na
+		core.ConstraintScenario[] indexScenarios = array.new<core.ConstraintScenario>()
+		core.ConstraintScenario[] inverseScenarios = array.new<core.ConstraintScenario>()
+		core.ConstraintMarker[] indexMarkers = array.new<core.ConstraintMarker>()
+		core.ConstraintMarker[] inverseMarkers = array.new<core.ConstraintMarker>()
+		if showConstraintPanel or showConstraintAlternatives or showPossibleConstraintRange
+			for side = 0 to 1
+				bool isIndex = side == 0
+				core.CycleNode[] chain = core.sideRuntime(ctx, isIndex).chain
+				core.ConstraintScenario[] scenarios = isIndex ? indexScenarios : inverseScenarios
+				core.ConstraintMarker[] markers = isIndex ? indexMarkers : inverseMarkers
+				int chainSize = array.size(chain)
+				if chainSize > 0
+					core.CycleNode current = array.last(chain)
+					int currentOrdinal = -1
+					int currentOrigin = core.weeklyOriginBar(ctx, isIndex)
+					int visibleCount = 0
+					for node in chain
+						if core.isVisibleDailyNode(node) and node.startBar >= currentOrigin
+							if node.startBar == current.startBar
+								currentOrdinal := visibleCount
+								break
+							visibleCount += 1
+					bool regularCurrent = core.isActiveRegularNode(current)
+					if regularCurrent
+						core.ConstraintScenario selected = core.makeDiagnosticScenario(cfg, isIndex, current.startBar, current.startBar, 10000, current.preLockInvalidated)
+						if not na(selected.lockBar) or selected.invalidated or core.diagnosticTailAlive(cfg, isIndex, selected.startBar)
+							array.push(scenarios, selected)
+						if chainSize >= 2
+							core.CycleNode parent = array.get(chain, chainSize - 2)
+							bool regularParent = parent.raccType == RACC_NONE
+							if regularParent
+								// Stesso ordine: alternative dirette, poi figli delle alternative del nonno.
+								for depth = 1 to 2
+									if chainSize >= depth + 1
+										core.CycleNode source = array.get(chain, chainSize - depth - 1)
+										if source.raccType == RACC_NONE
+											int selectedStart = array.get(chain, chainSize - depth).startBar
+											for c in core.scanCandidates(cfg, isIndex, source.startBar)
+												if core.diagnosticCandidateOk(cfg, c) and c.barIdx != selectedStart
+													core.Candidate[] children = depth == 1 ? array.from(c) : core.scanCandidates(cfg, isIndex, c.barIdx)
+													for child in children
+														if (depth == 1 or core.diagnosticCandidateOk(cfg, child) and child.barIdx > c.barIdx) and core.diagnosticTailAlive(cfg, isIndex, child.barIdx)
+															int priority = core.isEarly23Duration(cfg, c.duration) ? 2 : 1
+															int branchRank = depth == 1 ? 6000 - priority * 10 : 4000 - priority * 10 - (core.isEarly23Duration(cfg, child.duration) ? 2 : 1)
+															core.ConstraintScenario alternate = core.makeDiagnosticScenario(cfg, isIndex, c.barIdx, child.barIdx, branchRank, false)
+															array.push(scenarios, alternate)
+															int childCloseBar = depth == 2 ? core.cycleCloseBarFromDuration(isIndex, c.barIdx, child.duration) : na
+															if depth == 2
+																int parentDurationAtChild = core.cycleDurationFrom(isIndex, c.barIdx, child.barIdx)
+																bool parentFreeAtChild = parentDurationAtChild >= 1 and parentDurationAtChild <= cycleMaxBars + currentCheckDelay and na(core.firstLockBarUntil(cfg, isIndex, c.barIdx, c.price, child.barIdx))
+																if showConstraintAlternatives and parentFreeAtChild
+																	core.appendUniqueDiagnosticMarker(markers, c.barIdx, core.cycleCloseBarFromDuration(isIndex, source.startBar, c.duration), c.barIdx, currentOrdinal - 1, branchRank + 1)
+															if showConstraintAlternatives and na(alternate.lockBar) and not alternate.invalidated
+																core.appendUniqueDiagnosticMarker(markers, alternate.lineageBar, depth == 1 ? core.cycleCloseBarFromDuration(isIndex, source.startBar, c.duration) : childCloseBar, alternate.startBar, currentOrdinal, alternate.rank)
+		if showConstraintPanel or showConstraintAlternatives
+			for side = 0 to 1
+				bool isIndex = side == 0
+				core.CycleNode[] chain = core.sideRuntime(ctx, isIndex).chain
+				core.ConstraintScenario[] scenarios = isIndex ? indexScenarios : inverseScenarios
+				core.ConstraintMarker[] markers = isIndex ? indexMarkers : inverseMarkers
+				core.SideRuntime weeklyState = core.sideRuntime(ctx, isIndex)
+				core.CycleNode[] view = core.weeklyContextView(ctx, isIndex, chain)
+				map<int, int> points = core.weeklyCandidatePoints(cfg, ctx, isIndex, view)
+				int weeklyStart = weeklyState.startBar
+				bool weeklyFree = na(weeklyState.firstLockBar)
+				int weeklyContext = na
+				int bestBar = na
+				int bestRank = 0
+				int chainSize = array.size(chain)
+				map<int, int> lineageFlags = na // 1=maturo, 2=depth-2.
+				int matureTotal = 0
+				int depthTwoTotal = 0
+				for pass = 0 to 1
+					if pass == 1
+						if showConstraintPanel and na(weeklyContext) and not weeklyFree
+							weeklyFree := core.oldWeeklyConstraintInvalidated(cfg, ctx, isIndex, weeklyState)
+						lineageFlags := showConstraintPanel ? map.new<int, int>() : na
+						for scenario in scenarios
+							if showConstraintPanel
+								int age = core.cycleDurationFrom(isIndex, scenario.startBar, bar_index)
+								bool isFree = na(scenario.lockBar) and not scenario.invalidated
+								if isFree
+									int priorFlags = map.get(lineageFlags, scenario.lineageBar)
+									bool mature = age >= cycleMinBars
+									bool depthTwo = scenario.rank < 5000
+									if na(priorFlags)
+										map.put(lineageFlags, scenario.lineageBar, (mature ? 1 : 0) + (depthTwo ? 2 : 0))
+										matureTotal += mature ? 1 : 0
+										depthTwoTotal += depthTwo ? 1 : 0
+									else if depthTwo and priorFlags < 2
+										map.put(lineageFlags, scenario.lineageBar, priorFlags + 2)
+										depthTwoTotal += 1
+					for [candidateBar, parent] in points
+						[eligible, dx, rank, ordinal, contextStart, free] = core.weeklyReadingState(cfg, ctx, isIndex, core.weeklyPointView(view, parent), candidateBar, core.sidePivotOnBar(isIndex, candidateBar))
+						if pass == 0
+							if eligible and dx and rank > 0 and (na(weeklyContext) or contextStart > weeklyContext or contextStart == weeklyContext and core.betterWeeklyRestart(isIndex, candidateBar, rank, bestBar, bestRank))
+								bestBar := candidateBar
+								bestRank := rank
+								weeklyContext := contextStart
+								weeklyStart := candidateBar
+								weeklyFree := free
+						else if eligible and free and candidateBar != weeklyStart
+							if showConstraintAlternatives and chainSize > 0
+								core.appendUniqueDiagnosticMarker(markers, candidateBar, na, candidateBar, ordinal, 7000 + rank)
+							if showConstraintPanel and na(map.get(lineageFlags, candidateBar))
+								map.put(lineageFlags, candidateBar, dx ? 1 : 0)
+								matureTotal += dx ? 1 : 0
+				for scenario in scenarios
+					if showConstraintPanel and not na(scenario.lockBar)
+						int ownFlags = map.get(lineageFlags, scenario.lineageBar)
+						int freeLineages = map.size(lineageFlags) - (na(ownFlags) ? 0 : 1)
+						ownFlags := nz(ownFlags)
+						int otherMature = matureTotal - ownFlags % 2
+						bool hasDepthTwo = depthTwoTotal - (ownFlags >= 2 ? 1 : 0) > 0
+						int alternativePenalty = freeLineages == 0 ? 0 : otherMature >= 2 or hasDepthTwo ? 35 : otherMature == 1 ? 20 : 8
+						float scenarioStartPrice = core.sidePivotOnBar(isIndex, scenario.startBar)
+						[preLockExtreme, _] = core.scanPreLockExtreme(isIndex, scenario.startBar, scenario.lockBar)
+						[postLockBreak, worstFib] = core.postLockState(isIndex, scenarioStartPrice, scenario.lockBar, preLockExtreme, bar_index)
+						scenario.invalidated := scenario.invalidated or not na(postLockBreak)
+						if scenario.invalidated
+							scenario.score := 0
+						else
+							int age = core.cycleDurationFrom(isIndex, scenario.startBar, bar_index)
+							int timePenalty = int(math.round(25.0 * core.clamp01(1.0 - age / float(cycleMinBars))))
+							int lockOffset = bar_index - scenario.lockBar
+							float baseAtr = core.historyOffsetOk(lockOffset + 1) ? constraintAtr[lockOffset + 1] : na
+							float reaction = 0.0
+							float confirmation = 0.0
+							int bestProgressive = 1
+							if core.historyOffsetOk(lockOffset) and not na(baseAtr) and baseAtr > 0
+								float lockExtreme = core.sidePivotAt(isIndex, lockOffset)
+								float oppositeExtreme = core.oppositePivotAt(isIndex, lockOffset)
+								float lockDistance = isIndex ? scenarioStartPrice - lockExtreme : lockExtreme - scenarioStartPrice
+								float reactionDenominator = math.max(lockDistance, baseAtr * 0.25)
+								for k = 0 to 3
+									int reactionBar = scenario.lockBar + k
+									if reactionBar > bar_index
+										break
+									int offset = bar_index - reactionBar
+									float recoveryPrice = k == 0 ? close[offset] : core.oppositePivotAt(isIndex, offset)
+									float recovered = isIndex ? recoveryPrice - lockExtreme : lockExtreme - recoveryPrice
+									float recoveredAtr = recovered / baseAtr
+									float retracement = recovered / reactionDenominator
+									if recoveredAtr >= 0.75 and retracement >= 0.50
+										reaction := math.max(reaction, (1.0 - k * 0.15) * math.min(core.clamp01(recoveredAtr / 1.50), core.clamp01(retracement)))
+								float candleRange = isIndex ? oppositeExtreme - lockExtreme : lockExtreme - oppositeExtreme
+								int fastEndBar = math.min(bar_index, scenario.lockBar + 3)
+								if fastEndBar == scenario.lockBar
+									float closeDistance = isIndex ? close[lockOffset] - lockExtreme : lockExtreme - close[lockOffset]
+									confirmation := candleRange > 0 ? core.clamp01(1.0 - closeDistance / (candleRange * 0.25)) : 0.0
+								else
+									float followExtreme = lockExtreme
+									for b = scenario.lockBar + 1 to fastEndBar
+										float nextExtreme = core.sidePivotAt(isIndex, bar_index - b)
+										if core.isMoreExtreme(isIndex, nextExtreme, followExtreme)
+											followExtreme := nextExtreme
+									float extension = isIndex ? lockExtreme - followExtreme : followExtreme - lockExtreme
+									float lastClose = close[bar_index - fastEndBar]
+									float closeDistance = math.max(0.0, isIndex ? lastClose - followExtreme : followExtreme - lastClose)
+									confirmation := core.clamp01(extension / (baseAtr * 0.75)) * core.clamp01(1.0 - closeDistance / (baseAtr * 0.25))
+								float previousPivot = na
+								int previousPivotBar = na
+								int pullbackBar = na
+								int progressive = 1
+								int waveLastBar = math.min(bar_index - 1, core.cycleCloseBarFromDuration(isIndex, scenario.lockBar, raccT4MaxBars))
+								if waveLastBar >= scenario.lockBar + 1
+									for b = scenario.lockBar + 1 to waveLastBar
+										int offset = bar_index - b
+										float pivot = core.oppositePivotAt(isIndex, offset)
+										float pullback = core.sidePivotAt(isIndex, offset)
+										bool confirmedPivot = core.isMoreExtreme(isIndex, core.oppositePivotAt(isIndex, offset + 1), pivot) and core.isMoreExtreme(isIndex, core.oppositePivotAt(isIndex, offset - 1), pivot)
+										bool confirmedPullback = core.isMoreExtreme(isIndex, pullback, core.sidePivotAt(isIndex, offset + 1)) and core.isMoreExtreme(isIndex, pullback, core.sidePivotAt(isIndex, offset - 1))
+										if confirmedPullback and not na(previousPivotBar) and b > previousPivotBar
+											pullbackBar := b
+										if confirmedPivot
+											if na(previousPivot)
+												previousPivot := pivot
+												previousPivotBar := b
+											else if not na(pullbackBar) and pullbackBar > previousPivotBar and pullbackBar < b
+												float advance = isIndex ? pivot - previousPivot : previousPivot - pivot
+												progressive := advance >= baseAtr * 0.10 ? progressive + 1 : 1
+												bestProgressive := math.max(bestProgressive, progressive)
+												previousPivot := pivot
+												previousPivotBar := b
+												pullbackBar := na
+												if bestProgressive >= 3
+													break
+							float risk = math.max(reaction, core.clamp01((1.0 - worstFib) / 0.618))
+							risk += (1.0 - risk) * 0.60 * (bestProgressive >= 3 ? 1.0 : bestProgressive == 2 ? 0.5 : 0.0)
+							float netRisk = math.max(0.0, risk - confirmation)
+							int morphologyPenalty = int(math.round(15.0 * netRisk))
+							int computedRaccordoPenalty = 0
+							string morphologyDriver = netRisk >= 0.25 and risk >= 0.70 ? " · morf. forte" : netRisk >= 0.15 and risk >= 0.50 ? " · morf. sosp." : confirmation >= 0.60 and confirmation - risk >= 0.20 ? " · prosecuzione" : ""
+							string raccordoDriver = "R escluso" + morphologyDriver
+							[_, liveRaccLevel, liveRaccBar] = core.constraintStateUntil(cfg, isIndex, scenario.startBar, scenarioStartPrice, bar_index)
+							int grade = core.getRaccordoType(cfg, core.cycleDurationFrom(isIndex, scenario.startBar, liveRaccBar), not na(weeklyStart) ? liveRaccBar - weeklyStart : liveRaccBar)
+							int branchOffset = scenario.rank < 5000 ? 2 : 1
+							int branchBaseBar = chainSize >= branchOffset ? array.get(chain, chainSize - branchOffset).startBar : scenario.startBar
+							[lastT6, lastT5, lastT4] = core.collectRaccordoCooldowns(chain, 0, math.min(branchBaseBar, liveRaccBar))
+							if grade != RACC_INVALID and core.raccordoPhaseAllowed(cfg, ctx, isIndex, grade, liveRaccBar) and core.raccordoSpacingFromCooldowns(cfg, grade, liveRaccBar, lastT6, lastT5, lastT4)
+								int offset = bar_index - liveRaccBar
+								bool leftOk = not na(liveRaccLevel) and core.scanOffsetOk(offset) and core.checkSwingCondition(isIndex, true, offset, liveRaccLevel, 3)
+								bool shortRight = leftOk and core.checkRightConditionForRaccordo(isIndex, liveRaccBar, liveRaccLevel, grade)
+								bool raccordoRight = shortRight and core.checkSwingCondition(isIndex, false, offset, liveRaccLevel, currentCheckDelay)
+								bool fullRightAlive = raccordoRight or bar_index < liveRaccBar + currentCheckDelay and core.rightConditionAlive(isIndex, offset, liveRaccLevel, currentCheckDelay)
+								if shortRight and fullRightAlive
+									computedRaccordoPenalty := raccordoRight ? (grade == RACC_T6 ? 8 : grade == RACC_T5 ? 16 : 25) : (grade == RACC_T6 ? 4 : grade == RACC_T5 ? 8 : 13)
+									raccordoDriver := "R(" + core.raccText(grade) + ") " + (raccordoRight ? "conf." : "poss.") + morphologyDriver
+							scenario.score := math.max(0, 100 - timePenalty - computedRaccordoPenalty - alternativePenalty - morphologyPenalty)
+							scenario.driver := raccordoDriver + " · ALTERNATIVA " + str.tostring(freeLineages) + (weeklyFree ? " · W libera" : "")
+		table.clear(constraintTable, 0, 0, 2, 8)
+		int nextTableRow = 0
+		if showConstraintPanel
+			color headerBg = color.new(color.rgb(35, 47, 62), 8)
+			constraintRow(nextTableRow, "Lato", "Centratura", "Score\nvincolo", color.white, color.white, color.white, headerBg)
+			nextTableRow += 1
+			for side = 0 to 1
+				bool tableIndex = side == 0
+				core.ConstraintScenario[] tableScenarios = tableIndex ? indexScenarios : inverseScenarios
+				core.CycleNode[] tableChain = core.sideRuntime(ctx, tableIndex).chain
+				int tableCycleId = array.size(tableChain) > 0 ? array.last(tableChain).id : 0
+				// Slot 0 conserva la prima principale; 1..3 sono ordinati per score/rank.
+				core.ConstraintScenario[] tableTop = array.new<core.ConstraintScenario>(4, na)
+				for tableScenario in tableScenarios
+					if tableScenario.rank >= 9000 and na(array.get(tableTop, 0)) and (not na(tableScenario.lockBar) or tableScenario.invalidated)
+						array.set(tableTop, 0, tableScenario)
+					else if tableScenario.rank < 9000 and not na(tableScenario.lockBar) and not tableScenario.invalidated
+						for altSlot = 1 to 3
+							if core.diagnosticTableBetter(tableScenario, array.get(tableTop, altSlot))
+								array.insert(tableTop, altSlot, tableScenario)
+								array.pop(tableTop)
+								break
+				int tableDrawn = 0
+				for slot = 0 to 3
+					core.ConstraintScenario tableScenario = array.get(tableTop, slot)
+					if tableDrawn < 3 and not na(tableScenario)
+						string sideName = tableIndex ? "Indice" : "Inverso"
+						string scoreBand = na(tableScenario.score) ? "" : tableScenario.score >= 90 ? "ALTA" : tableScenario.score >= 70 ? "MEDIA" : tableScenario.score >= 45 ? "FRAGILE" : "BASSA"
+						string scoreText = tableScenario.invalidated ? "0/100 · INVALIDATO" : str.tostring(tableScenario.score) + "/100 · " + scoreBand + "\n" + tableScenario.driver
+						string scenarioName = (slot == 0 ? "PRINCIPALE" : "ALTERNATIVA " + str.tostring(slot)) + "\n" + core.fmtLbl(tableIndex, math.max(0, tableCycleId), false)
+						color scoreColor = na(tableScenario.score) ? color.gray : tableScenario.score >= 90 ? color.rgb(76, 210, 145) : tableScenario.score >= 70 ? color.rgb(255, 209, 102) : tableScenario.score >= 45 ? color.rgb(255, 150, 92) : color.rgb(255, 105, 120)
+						color rowBg = slot == 0 ? color.new(color.rgb(51, 74, 94), 38) : color.new(color.rgb(25, 36, 49), 42)
+						constraintRow(nextTableRow, sideName, scenarioName, scoreText, tableIndex ? labelColorIndex : labelColorInverse, color.white, scoreColor, rowBg)
+						nextTableRow += 1
+						tableDrawn += 1
+		for side = 0 to 1
+			bool isIndex = side == 0
+			core.SideRuntime state = core.sideRuntime(ctx, isIndex)
+			core.ConstraintMarker[] dmMarkers = isIndex ? indexMarkers : inverseMarkers
+			core.ConstraintScenario[] dmScenarios = isIndex ? indexScenarios : inverseScenarios
+			label[] dmStore = state.scenarioLabels
+			core.clearLabelStore(dmStore)
+			int dmConstraintLockBar = na
+			if array.size(dmScenarios) > 0
+				core.ConstraintScenario dmPrimary = array.first(dmScenarios)
+				if dmPrimary.rank >= 9000 and not dmPrimary.invalidated
+					dmConstraintLockBar := dmPrimary.lockBar
+			string dmCenteringLegend = ""
+			string dmExplanationLegend = ""
+			bool dmHasDoubt = false
+			if showConstraintAlternatives and not na(dmConstraintLockBar) and array.size(dmMarkers) > 0
+				int[] dmVisibleLineages = array.new<int>()
+				while array.size(dmVisibleLineages) < visibleConstraintAlternatives
+					int dmBestLineage = na
+					int dmBestRank = -100000
+					for dmMarker in dmMarkers
+						bool dmNeedsDot = not showGhosts or dmMarker.rank < 5000 or dmMarker.rank >= 7000
+						int dmVisualRank = dmMarker.rank + (not na(dmMarker.closeBar) ? 10000 : 0)
+						if dmNeedsDot and not array.includes(dmVisibleLineages, dmMarker.lineageBar) and dmVisualRank > dmBestRank
+							dmBestLineage := dmMarker.lineageBar
+							dmBestRank := dmVisualRank
+					if na(dmBestLineage)
+						break
+					array.push(dmVisibleLineages, dmBestLineage)
+				// Un solo pallino per lineage: i normali "?" mostrano gia' le singole
+				// chiusure candidate; qui evidenziamo soltanto la centratura libera corrente.
+				if array.size(dmVisibleLineages) > 0
+					for [dmPosition, dmLineageBar] in dmVisibleLineages
+						core.ConstraintMarker dmLatest = na
+						bool dmCanReassignLock = false
+						for dmMarker in dmMarkers
+							bool dmNeedsDot = not showGhosts or dmMarker.rank < 5000 or dmMarker.rank >= 7000
+							if dmNeedsDot and dmMarker.lineageBar == dmLineageBar
+								dmCanReassignLock := dmCanReassignLock or not na(dmMarker.closeBar) and dmMarker.closeBar >= dmConstraintLockBar
+								if na(dmLatest) or dmMarker.startBar > dmLatest.startBar or (dmMarker.startBar == dmLatest.startBar and dmMarker.rank > dmLatest.rank)
+									dmLatest := dmMarker
+						if not na(dmLatest)
+							bool dmWeeklyFree = dmLatest.rank >= 7000
+							int dmStartCycleId = dmLatest.cycleId
+							string dmStartText = (dmWeeklyFree ? (isIndex ? "New T? / " : "New Ti? / ") : "") + core.fmtLbl(isIndex, math.max(0, dmStartCycleId), false)
+							int dmOffset = bar_index - dmLatest.startBar
+							if core.historyOffsetOk(dmOffset)
+								float dmMarkerPrice = core.sidePivotAt(isIndex, dmOffset)
+								float dmGap = math.max(math.max(nz(constraintAtr) * 0.12, math.abs(dmMarkerPrice) * 0.0005), syminfo.mintick * 4.0)
+								float dmMarkerY = dmMarkerPrice + (isIndex ? -dmGap : dmGap) * 1.15
+								string dmNumber = str.tostring(dmPosition + 1)
+								string dmGlyph = core.markerShapeGlyph(alternativeMarkerShape, isIndex)
+								string dmMarkerText = "ALTERNATIVA " + dmNumber + "\n" + dmStartText + " parte qui senza vincolo." + (dmCanReassignLock ? "\nIl vincolo puo' appartenere al ciclo precedente." : "")
+								label dmLbl = core.plainTimeLabel(time[dmOffset], dmMarkerY, dmGlyph, alternativeOpenColor, size.large)
+								label.set_tooltip(dmLbl, dmMarkerText)
+								array.push(dmStore, dmLbl)
+								dmCenteringLegend += (str.length(dmCenteringLegend) > 0 ? "\n" : "") + dmNumber + " · " + dmGlyph + " " + dmStartText
+								dmExplanationLegend += (str.length(dmExplanationLegend) > 0 ? "\n" : "") + dmNumber + " · NON VINCOLATA" + (dmCanReassignLock ? "\n  Il vincolo puo' essere del ciclo prima" : "")
+								dmHasDoubt := dmHasDoubt or dmCanReassignLock
+			if showConstraintPanel and str.length(dmCenteringLegend) > 0
+				int dmLegendRow = isIndex ? 7 : 8
+				color dmLegendBg = color.new(color.rgb(25, 36, 49), 30)
+				constraintRow(dmLegendRow, "ALTERNATIVE\n" + (isIndex ? "INDICE" : "INVERSO"), "CENTRATURA LIBERA\n" + dmCenteringLegend, "SPIEGAZIONE\n" + dmExplanationLegend, color.white, alternativeOpenColor, dmHasDoubt ? alternativeCloseColor : color.white, dmLegendBg)
+			core.ConstraintScenario[] rtScenarios = isIndex ? indexScenarios : inverseScenarios
+			core.CycleNode[] rtChain = state.chain
+			line[] rtStore = state.timingLines
+			// I linefill vengono eliminati automaticamente insieme a una delle linee
+			// sorgente: un solo rtStore mantiene quindi rtTarget e fasce sempre sincronizzati.
+			core.clearLineStore(rtStore)
+			float rtY1 = low
+			float rtY2 = high
+			if rtY1 == rtY2
+				float rtGap = math.max(math.abs(close) * 0.0001, syminfo.mintick)
+				rtY1 -= rtGap
+				rtY2 += rtGap
+			if showConstraintTiming and array.size(rtChain) > 0
+				core.CycleNode rtNode = array.last(rtChain)
+				bool rtVisible = core.isActiveRegularNode(rtNode) and rtNode.isLocked and not rtNode.preLockInvalidated
+				if rtVisible
+					for rtTarget = 0 to 2
+						int rtDuration = rtTarget == 0 ? cycleMinBars - 1 : rtTarget == 1 ? cycleMinBars : 44
+						color rtMarkerColor = rtTarget == 0 ? timingEarlyColor : rtTarget == 1 ? timingMinColor : timing44Color
+						int rtTargetBar = core.cycleCloseBarFromDuration(isIndex, rtNode.startBar, rtDuration)
+						array.push(rtStore, core.indexVertical(rtTargetBar, rtY1, rtY2, color.new(rtMarkerColor, 78), extend.both, 5))
+			if showPossibleConstraintRange and rangeOpacity > 0 and array.size(rtChain) > 0 and array.size(rtScenarios) > 0
+				int rtChainSize = array.size(rtChain)
+				core.CycleNode rtCurrent = array.last(rtChain)
+				int rtOfficialLegacyStart = na
+				bool rtOfficialLegacySpecial = rtChainSize > 1 and array.get(rtChain, rtChainSize - 2).raccType != RACC_NONE
+				if rtChainSize > 1
+					for rtI = rtChainSize - 2 to 0
+						core.CycleNode rtOldNode = array.get(rtChain, rtI)
+						if na(rtOfficialLegacyStart) and core.isVisibleDailyNode(rtOldNode) and rtOldNode.startBar < rtCurrent.startBar
+							rtOfficialLegacyStart := rtOldNode.startBar
+							break
+				int rtCommonLeft = na
+				int rtCommonCoreRight = na
+				int rtLatestLegacy44 = na
+				float rtRangeY1 = na
+				bool rtForceDoubt = false
+				for rtScenario in rtScenarios
+					bool rtFree = na(rtScenario.lockBar) and not rtScenario.invalidated
+					if rtFree
+						int rtLeft = core.cycleCloseBarFromDuration(isIndex, rtScenario.startBar, 7)
+						int rtCoreRight = core.cycleCloseBarFromDuration(isIndex, rtScenario.startBar, cycleMinBars - 2)
+						rtCommonLeft := na(rtCommonLeft) ? rtLeft : math.max(rtCommonLeft, rtLeft)
+						rtCommonCoreRight := na(rtCommonCoreRight) ? rtCoreRight : math.min(rtCommonCoreRight, rtCoreRight)
+						float rtScenarioStartPrice = core.sidePivotOnBar(isIndex, rtScenario.startBar)
+						if not na(rtScenarioStartPrice) and (na(rtRangeY1) or core.isMoreExtreme(isIndex, rtScenarioStartPrice, rtRangeY1))
+							rtRangeY1 := rtScenarioStartPrice
+						int rtLegacyStart = rtScenario.rank < 5000 ? rtScenario.lineageBar : rtOfficialLegacyStart
+						if not na(rtLegacyStart) and rtLegacyStart < rtScenario.startBar
+							int rtLegacy44 = core.cycleCloseBarFromDuration(isIndex, rtLegacyStart, rangeLegacyMaxBars)
+							rtLatestLegacy44 := na(rtLatestLegacy44) ? rtLegacy44 : math.max(rtLatestLegacy44, rtLegacy44)
+						if rtScenario.rank >= 5000 and rtOfficialLegacySpecial
+							rtForceDoubt := true
+				if not na(rtRangeY1) and not na(rtCommonLeft) and rtCommonLeft <= rtCommonCoreRight
+					float rtRangeStep = math.max(math.abs(rtRangeY1) * 0.0001, syminfo.mintick)
+					float rtRangeY2 = rtRangeY1 + (isIndex ? -rtRangeStep : rtRangeStep)
+					int rtTransparency = 100 - rangeOpacity
+					int rtDoubtRight = rtForceDoubt ? rtCommonCoreRight : na(rtLatestLegacy44) ? rtCommonLeft - 1 : math.min(rtCommonCoreRight, rtLatestLegacy44)
+					int rtSafeLeft = rtForceDoubt ? rtCommonCoreRight + 1 : math.max(rtCommonLeft, na(rtLatestLegacy44) ? rtCommonLeft : rtLatestLegacy44 + 1)
+					for rtBand = 0 to 2
+						int rtLeft = rtBand == 0 ? rtCommonLeft : rtBand == 1 ? rtSafeLeft : rtCommonCoreRight + 1
+						int rtRight = rtBand == 0 ? rtDoubtRight : rtBand == 1 ? rtCommonCoreRight : rtCommonCoreRight + 1
+						color rtBandColor = rtBand == 1 ? (isIndex ? rangeSafeIndexColor : rangeSafeInverseColor) : rangeDoubtColor
+						int rtVisibleLeft = math.max(bar_index, rtLeft)
+						if rtVisibleLeft <= rtRight
+							line rtLeftLine = core.indexVertical(rtVisibleLeft, rtRangeY1, rtRangeY2, color(na), extend.right, 1)
+							line rtRightLine = core.indexVertical(rtRight + 1, rtRangeY1, rtRangeY2, color(na), extend.right, 1)
+							array.push(rtStore, rtLeftLine)
+							array.push(rtStore, rtRightLine)
+							linefill.new(rtLeftLine, rtRightLine, color.new(rtBandColor, rtTransparency))
