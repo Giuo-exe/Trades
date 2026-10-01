@@ -60,10 +60,18 @@ function buildAsset(asset, detail) {
 
 const PINE_CODES = { VAH: 'VAH', VAL: 'VAL', POC: 'POC', LVN: 'LVN', 'Gamma flip': 'FLIP', 'Call wall': 'CW', 'Put wall': 'PW', Iceberg: 'ICE', Assorbimento: 'ABS' };
 
+// I livelli gamma (flip ricalcolato, walls dell'oro riscalate da GLD) cambiano di frazioni a ogni ricalcolo:
+// arrotondati a ~0,01% del prezzo, tv-sync riscrive l'indicatore solo quando si spostano davvero.
+function gammaStep(price) {
+  return 10 ** Math.round(Math.log10(price * 0.0001));
+}
+
 function buildLevels(asset) {
   const a = buildAsset(asset, false);
   const levels = a.regime.levels;
-  const pine = levels.map((l) => `${PINE_CODES[l.name] ?? l.name}:${+l.price.toFixed(4)}`).join(';');
+  const step = a.price > 0 ? gammaStep(a.price) : null;
+  const value = (l) => (step && l.kind === 'gamma' ? Math.round(l.price / step) * step : l.price);
+  const pine = levels.map((l) => `${PINE_CODES[l.name] ?? l.name}:${+value(l).toFixed(4)}`).join(';');
   return { asset, symbol: a.symbol, price: a.price, weather: a.regime.weather, levels, pine };
 }
 

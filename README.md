@@ -69,7 +69,12 @@ Serve TradingView avviato con la porta di debug (punto 1 sotto).
    sovrascrivere: il Pine Editor non viene toccato) e lo aggiunge al grafico attivo se manca. Dopo il salvataggio
    rilegge l'elenco e controlla che nessun altro script sia cambiato. Rilanciarlo non crea doppioni.
 3. Se modifichi `tradingview/meteo-livelli.pine`: `npm run tv-setup -- --update` salva una nuova versione dello stesso
-   script; TradingView aggiorna l'indicatore già sul grafico.
+   script e porta alla nuova versione l'indicatore già sul grafico. Alla fine controlla che lo studio non sia in
+   errore: se lo e', lo segnala invece di dire "Fatto".
+
+**Se nella legenda compare un "!" rosso accanto a "Meteo"** (es. "Can't parse pine" o "Calculation failed"): togli
+"Meteo Livelli" dal grafico e rimettilo da Indicatori → I miei script. Uno studio aggiunto da zero parte con gli
+input giusti e tv-sync riscrive livelli e meteo entro 15 s.
 
 A mano: Pine Editor → **Crea nuovo → Indicatore**, incolla il file, salva come "Meteo Livelli", **Aggiungi al grafico**.
 
@@ -78,7 +83,8 @@ A mano: Pine Editor → **Crea nuovo → Indicatore**, incolla il file, salva co
    Chiude le finestre di TradingView aperte.
 2. `npm run tv-sync`: ogni 15 s legge il simbolo del grafico attivo (BTC, ETH, SOL, oro: alias in `config.json`),
    chiede i livelli alla dashboard e aggiorna gli input dell'indicatore "Meteo Livelli". Scrive solo quando i livelli
-   cambiano. Non aggiunge né toglie indicatori: se manca dal grafico lo segnala nel log.
+   cambiano, e solo i due input dei dati (livelli e meteo): mai colori o altre impostazioni. Uno studio in errore non
+   lo tocca e lo segnala nel log. Non aggiunge né toglie indicatori: se manca dal grafico lo segnala nel log.
    L'alias va seguito da una quotazione in dollari o da una scadenza (`BTCUSDT.P`, `XAUUSD`, `GC1!`): `BTC.D`, `ETHBTC`,
    `BTCDOMUSDT` non contano. Un alias con l'exchange (`TVC:GOLD`) vale solo per quel simbolo.
    Con `"autoAddIndicator": true` nella sezione `tradingview` lo aggiunge una volta per grafico e per avvio, se il
